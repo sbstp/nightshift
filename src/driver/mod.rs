@@ -15,7 +15,7 @@ use attr::FileAttrBuilder;
 use fuser::FileAttr;
 use slab::Slab;
 
-use crate::queries::{self, dir_entry::ListDirEntry};
+use crate::queries::{self, block::Compression, dir_entry::ListDirEntry};
 use crate::types::FileType;
 use crate::{database::DatabaseOps, time::TimeSpec};
 use crate::{
@@ -30,13 +30,15 @@ const DURATION: Duration = Duration::from_secs(0);
 
 pub struct FuseDriver {
     pub db: DatabaseOps,
+    compression: Compression,
     handles: Slab<FileHandle>,
 }
 
 impl FuseDriver {
-    pub fn new(db: DatabaseOps) -> Self {
+    pub fn new(db: DatabaseOps, compression: Compression) -> Self {
         Self {
             db,
+            compression,
             handles: Slab::new(),
         }
     }
@@ -98,7 +100,7 @@ impl FuseDriver {
                 match queries::block::get_block(tx, ino, bno) {
                     Ok(mut block) => {
                         block.truncate(size);
-                        queries::block::update(tx, &block)?;
+                        queries::block::update(tx, &block, self.compression)?;
                     }
                     Err(Error::NotFound) => {}
                     Err(e) => return Err(e),
@@ -219,7 +221,9 @@ impl FuseDriver {
 
     fn open_impl(&mut self, _req: RequestInfo, ino: u64, flags: OpenFlags) -> Result<(u64, u32)> {
         let attr = self.db.with_read_tx(|tx| queries::inode::lookup(tx, ino))?;
-        let fh = self.handles.insert(FileHandle::new(ino, attr.size, flags));
+        let fh = self
+            .handles
+            .insert(FileHandle::new(ino, attr.size, flags, self.compression));
         let fh = u64::try_from(fh).map_err(|_| Error::Overflow)?;
         Ok((fh, flags.bits as u32))
     }
@@ -637,8 +641,13 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::{attr::FileAttrBuilder, FuseDriver, OpenFlags, RequestInfo};
-    use crate::{database::DatabaseOps, errors::Error, queries, types::FileType};
-    use rand::{Rng, RngCore};
+    use crate::{
+        database::DatabaseOps,
+        errors::Error,
+        queries::{self, block::Compression},
+        types::FileType,
+    };
+    use rand::{seq::SliceRandom, Rng, RngCore};
     use sha1::{Digest, Sha1};
     use test_log::test;
 
@@ -656,7 +665,7 @@ mod tests {
     #[test]
     fn test_lookup() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, queries::block::Compression::None);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
         let mut node = FileAttrBuilder::new_node(FileType::RegularFile)
@@ -685,7 +694,7 @@ mod tests {
     #[test]
     fn test_mknod() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, queries::block::Compression::LZ4);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
 
@@ -720,7 +729,7 @@ mod tests {
     #[test]
     fn test_link_unlink() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, Compression::Zstd);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
         let mut node = FileAttrBuilder::new_node(FileType::RegularFile)
@@ -732,7 +741,7 @@ mod tests {
             queries::inode::create(tx, &mut root_dir)?;
             queries::inode::create(tx, &mut node)?;
             queries::dir_entry::create(tx, root_dir.ino, OsStr::new("foo.txt"), node.ino)?;
-            queries::block::create(tx, node.ino, 0, b"hello world!")?;
+            queries::block::create(tx, node.ino, 0, b"hello world!", queries::block::Compression::Zstd)?;
             Ok(())
         })?;
 
@@ -777,7 +786,7 @@ mod tests {
     #[test]
     fn test_mkdir() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, Compression::None);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
 
@@ -805,7 +814,7 @@ mod tests {
     #[test]
     fn test_rmdir() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, Compression::None);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
         let mut dir1 = FileAttrBuilder::new_directory().build();
@@ -836,7 +845,7 @@ mod tests {
     #[test]
     fn test_read_write_cycle() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, Compression::None);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
         let mut node = FileAttrBuilder::new_node(FileType::RegularFile)
@@ -865,7 +874,7 @@ mod tests {
     #[test]
     fn test_rename() -> anyhow::Result<()> {
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let mut driver = FuseDriver::new(db, Compression::None);
 
         let mut root_dir = FileAttrBuilder::new_directory().build();
         let mut node = FileAttrBuilder::new_node(FileType::RegularFile)
@@ -905,15 +914,19 @@ mod tests {
 
     #[test]
     fn test_for_corruption() -> anyhow::Result<()> {
+        let mut rng = rand::thread_rng();
+
         let db = DatabaseOps::open_in_memory()?;
-        let mut driver = FuseDriver::new(db);
+        let compression = [Compression::None, Compression::LZ4, Compression::Zstd]
+            .choose(&mut rng)
+            .unwrap();
+        let mut driver = FuseDriver::new(db, Compression::LZ4);
 
         let attr = driver.mknod_impl(RequestInfo::default(), 1, OsStr::new("foo"), libc::S_IFREG, 0, 0)?;
         let (fh, _) = driver.open_impl(RequestInfo::default(), attr.ino, OpenFlags::from(libc::O_RDWR))?;
 
         let max = 10 * 1024 * 1024;
         let mut write_offset = 0;
-        let mut rng = rand::thread_rng();
 
         let mut write_hasher = Sha1::new();
         let mut read_hahser = Sha1::new();

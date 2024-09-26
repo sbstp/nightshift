@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use queries::block::Compression;
 use scopeguard::defer;
 
 use crate::database::DatabaseOps;
@@ -119,7 +120,7 @@ fn main() -> anyhow::Result<()> {
             key_group,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db);
+            let driver = FuseDriver::new(db, Compression::Zstd);
 
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
@@ -142,7 +143,7 @@ fn main() -> anyhow::Result<()> {
             args,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db);
+            let driver = FuseDriver::new(db, Compression::Zstd);
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
                 // Umount & cleanup

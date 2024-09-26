@@ -44,7 +44,8 @@ CREATE INDEX IF NOT EXISTS entry_parent_ino_name_idx ON dir_entry (parent_ino, n
 CREATE TABLE IF NOT EXISTS block (
     ino INTEGER NOT NULL REFERENCES inode(ino) ON UPDATE CASCADE ON DELETE CASCADE, -- if inode is deleted, delete all data blocks
     bno INTEGER NOT NULL,
-    data BLOB NOT NULL
+    data BLOB NOT NULL,
+    compression INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS block_bno_idx ON block (bno);

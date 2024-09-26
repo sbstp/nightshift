@@ -9,6 +9,7 @@ pub enum Error {
     InvalidArgument,
     Overflow,
     Other(String),
+    InvalidCompression,
 }
 
 impl Error {
@@ -18,6 +19,7 @@ impl Error {
             Error::NotFound => libc::ENOENT,
             Error::InvalidArgument => libc::EINVAL,
             Error::Overflow => libc::EOVERFLOW,
+            Error::InvalidCompression => libc::EINVAL,
             Error::Other(_) => libc::ENOTSUP, // Need better code
         }
     }
@@ -45,6 +47,7 @@ impl std::fmt::Display for Error {
             Error::NotFound => write!(f, "Not Found"),
             Error::InvalidArgument => write!(f, "Invalid Argument"),
             Error::Overflow => write!(f, "Overflow"),
+            Error::InvalidCompression => write!(f, "Invalid Compression Scheme"),
             Error::Other(msg) => write!(f, "Other: {}", msg),
         }
     }

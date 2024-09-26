@@ -3,6 +3,7 @@ use std::cmp;
 use crate::driver::OpenFlags;
 use crate::errors::Result;
 use crate::queries;
+use crate::queries::block::Compression;
 
 const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
@@ -16,16 +17,18 @@ pub struct FileHandle {
     write_offset: u64,
     /// Write data buffer used to optimize writes.
     pub buf: Vec<u8>,
+    compression: Compression,
 }
 
 impl FileHandle {
-    pub fn new(ino: u64, size: u64, flags: OpenFlags) -> Self {
+    pub fn new(ino: u64, size: u64, flags: OpenFlags, compression: Compression) -> Self {
         FileHandle {
             ino,
             size,
             flags,
             write_offset: 0,
             buf: Vec::with_capacity(BUFFER_SIZE),
+            compression,
         }
     }
 
@@ -80,12 +83,12 @@ impl FileHandle {
         })?;
 
         for block in modified_blocks {
-            queries::block::update(tx, &block)?;
+            queries::block::update(tx, &block, self.compression)?;
         }
 
         // Write the rest of the data in a new block.
         while !data.is_empty() {
-            let written = queries::block::create(tx, self.ino, new_offset, data)?;
+            let written = queries::block::create(tx, self.ino, new_offset, data, self.compression)?;
             data = &data[written as usize..];
             new_offset += written;
             attr.size += written;
@@ -108,7 +111,7 @@ mod tests {
     use crate::driver::attr::FileAttrBuilder;
     use crate::driver::{FileHandle, OpenFlags};
     use crate::queries;
-    use crate::queries::block::BLOCK_SIZE;
+    use crate::queries::block::{Compression, BLOCK_SIZE};
     use test_log::test;
 
     #[test]
@@ -119,6 +122,7 @@ mod tests {
             flags: OpenFlags::from(0),
             write_offset: 0,
             buf: Vec::with_capacity(37),
+            compression: Compression::None,
         };
         assert_eq!(fh.buffer_remaining(), 37);
     }
@@ -131,6 +135,7 @@ mod tests {
             flags: OpenFlags::from(0),
             write_offset: 0,
             buf: vec![0; 37],
+            compression: Compression::None,
         };
         assert!(fh.buffer_full());
         fh.buf.reserve(10);
@@ -145,6 +150,7 @@ mod tests {
             flags: OpenFlags::from(0),
             write_offset: 0,
             buf: Vec::with_capacity(1000),
+            compression: Compression::None,
         };
         fh.seek_to(500);
         assert_eq!(fh.write_offset(), 500);
@@ -159,6 +165,7 @@ mod tests {
             flags: OpenFlags::from(0),
             write_offset: 0,
             buf: vec![0; 37],
+            compression: Compression::None,
         };
         fh.seek_to(0);
     }
@@ -171,6 +178,7 @@ mod tests {
             flags: OpenFlags::from(0),
             write_offset: 1000,
             buf: Vec::with_capacity(64),
+            compression: Compression::None,
         };
         assert_eq!(5, fh.consume_input(&[5; 5]));
         assert_eq!(59, fh.consume_input(&[5; 100]));
@@ -185,7 +193,7 @@ mod tests {
 
         let mut attr = FileAttrBuilder::new_node(crate::types::FileType::RegularFile).build();
         queries::inode::create(&mut tx, &mut attr)?;
-        let mut fh = FileHandle::new(attr.ino, attr.size, OpenFlags::from(0));
+        let mut fh = FileHandle::new(attr.ino, attr.size, OpenFlags::from(0), Compression::None);
 
         //
         // Simple consecutive write...

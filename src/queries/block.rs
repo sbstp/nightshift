@@ -6,11 +6,17 @@ use rusqlite::params;
 pub const BLOCK_SIZE: u64 = 128 * 1024;
 
 pub fn get_block(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) -> Result<Block> {
-    let mut stmt = tx.prepare_cached("SELECT bno, data FROM block WHERE ino = ? AND bno = ?")?;
+    let mut stmt = tx.prepare_cached("SELECT bno, data, compression FROM block WHERE ino = ? AND bno = ?")?;
     let block = stmt.query_row(params![ino, bno], |row| {
         let data = row.get_ref(1)?.as_blob()?;
-        let block = Block::from_compressed(ino, row.get(0)?, data);
-        Ok(block)
+        let compression: Option<u8> = row.get(2)?;
+        let block = CompressedBlock {
+            ino,
+            bno,
+            compression: compression.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, // TODO: better error
+            data,
+        };
+        Ok(block.decompress())
     })?;
     Ok(block)
 }
@@ -22,12 +28,19 @@ pub fn iter_blocks_from(
     mut iter: impl FnMut(Block) -> Result<bool>,
 ) -> Result<()> {
     let bno = Block::offset_to_bno(offset);
-    let mut stmt = tx.prepare_cached("SELECT bno, data FROM block WHERE ino = ? AND bno >= ? ORDER BY bno")?;
+    let mut stmt =
+        tx.prepare_cached("SELECT bno, data, compression FROM block WHERE ino = ? AND bno >= ? ORDER BY bno")?;
     let mut rows = stmt.query(params![ino, bno])?;
     while let Some(row) = rows.next()? {
         let data = row.get_ref(1)?.as_blob()?;
-        let block = Block::from_compressed(ino, row.get(0)?, data);
-        let more = iter(block)?;
+        let compression: Option<u8> = row.get(2)?;
+        let block = CompressedBlock {
+            ino,
+            bno,
+            compression: compression.try_into()?,
+            data,
+        };
+        let more = iter(block.decompress())?;
         if !more {
             break;
         }
@@ -35,25 +48,31 @@ pub fn iter_blocks_from(
     Ok(())
 }
 
-pub fn update(tx: &mut rusqlite::Transaction, block: &Block) -> Result<()> {
+pub fn update(tx: &mut rusqlite::Transaction, block: &Block, compression: Compression) -> Result<()> {
     let mut buf = Vec::new();
-    let compressed_data = block.compress_into(&mut buf);
+    let cb = CompressedBlock::compress(block, compression, &mut buf);
 
-    let mut stmt = tx.prepare_cached("UPDATE block SET data = ? WHERE ino = ? AND bno = ?")?;
-    stmt.execute(params![compressed_data, block.ino, block.bno])?;
+    let mut stmt = tx.prepare_cached("UPDATE block SET data = ?, compression = ? WHERE ino = ? AND bno = ?")?;
+    stmt.execute(params![cb.data, cb.compression as u8, block.ino, block.bno])?;
 
     Ok(())
 }
 
-pub fn create(tx: &mut rusqlite::Transaction, ino: u64, offset: u64, data: &[u8]) -> Result<u64> {
+pub fn create(
+    tx: &mut rusqlite::Transaction,
+    ino: u64,
+    offset: u64,
+    data: &[u8],
+    compression: Compression,
+) -> Result<u64> {
     let bno = Block::offset_to_bno(offset);
     let mut block = Block::empty(ino, bno);
     let written = block.consume(data);
     let mut buf = Vec::new();
-    let compressed_data = block.compress_into(&mut buf);
+    let cb = CompressedBlock::compress(&block, compression, &mut buf);
 
-    let mut stmt = tx.prepare_cached("INSERT INTO block (ino, bno, data) VALUES (?, ?, ?)")?;
-    stmt.execute(params![block.ino, block.bno, compressed_data])?;
+    let mut stmt = tx.prepare_cached("INSERT INTO block (ino, bno, data, compression) VALUES (?, ?, ?, ?)")?;
+    stmt.execute(params![block.ino, block.bno, cb.data, compression as u8])?;
 
     Ok(written)
 }
@@ -62,6 +81,95 @@ pub fn remove_blocks_from(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) ->
     let mut stmt = tx.prepare_cached("DELETE FROM block WHERE ino = ? AND bno >= ?")?;
     stmt.execute(params![ino, bno])?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u8)]
+pub enum Compression {
+    None = 0,
+    LZ4 = 1,
+    Zstd = 2,
+}
+
+impl TryFrom<Option<u8>> for Compression {
+    type Error = crate::errors::Error;
+
+    fn try_from(value: Option<u8>) -> std::result::Result<Self, Self::Error> {
+        match value {
+            None | Some(1) => Ok(Compression::LZ4),
+            Some(0) => Ok(Compression::None),
+            Some(2) => Ok(Compression::Zstd),
+            _ => Err(crate::errors::Error::InvalidCompression),
+        }
+    }
+}
+
+pub struct CompressedBlock<'d> {
+    // Inode number.
+    pub ino: u64,
+    /// Block number.
+    pub bno: u64,
+    /// Compression scheme
+    pub compression: Compression,
+    // Block data. Always compressed
+    pub data: &'d [u8],
+}
+
+impl<'d> CompressedBlock<'d> {
+    pub fn decompress(self) -> Block {
+        let buf = match self.compression {
+            Compression::None => {
+                let mut buf = self.data.to_owned();
+                buf.truncate(buf.len());
+                buf
+            }
+            Compression::LZ4 => {
+                let mut buf = vec![0u8; BLOCK_SIZE as usize];
+                let n = lz4_flex::decompress_into(self.data, &mut buf).expect("lz4 decompress output too small");
+                log::debug!("LZ4 decompress {} result {}", self.data.len(), n);
+                buf.truncate(n);
+                buf
+            }
+            Compression::Zstd => {
+                let mut buf = vec![0u8; BLOCK_SIZE as usize];
+                zstd::stream::copy_decode(self.data, &mut buf).expect("zstd decompress error");
+                log::debug!("Zstd decompress {} result {}", self.data.len(), buf.len());
+                buf.truncate(buf.len());
+                buf
+            }
+        };
+        Block {
+            ino: self.ino,
+            bno: self.bno,
+            data: buf,
+        }
+    }
+
+    pub fn compress(block: &Block, compression: Compression, scratch: &'d mut Vec<u8>) -> CompressedBlock<'d> {
+        scratch.clear();
+
+        match compression {
+            Compression::None => scratch.extend_from_slice(&block.data),
+            Compression::LZ4 => {
+                let max_size = lz4_flex::block::get_maximum_output_size(block.data.len());
+                scratch.resize(max_size, 0);
+                let written = lz4_flex::compress_into(&block.data, scratch).expect("lz4 compress output too small");
+                log::debug!("LZ4 compress {} result {}", block.data.len(), written);
+                scratch.truncate(written);
+            }
+            Compression::Zstd => {
+                zstd::stream::copy_encode(&block.data[..], &mut *scratch, 0).expect("");
+                log::debug!("Zstd compress {} result {}", block.data.len(), scratch.len());
+            }
+        }
+
+        CompressedBlock {
+            ino: block.ino,
+            bno: block.bno,
+            compression,
+            data: &scratch[..],
+        }
+    }
 }
 
 pub struct Block {
@@ -82,28 +190,8 @@ impl Block {
         }
     }
 
-    pub fn from_compressed(ino: u64, bno: u64, compressed_data: &[u8]) -> Block {
-        let mut b = Block {
-            ino,
-            bno,
-            data: vec![0u8; BLOCK_SIZE as usize],
-        };
-        let n = lz4_flex::decompress_into(compressed_data, &mut b.data).expect("lz4 decompress output too small");
-        log::debug!("decompress {} result {}", compressed_data.len(), n);
-        b.data.truncate(n);
-        b
-    }
-
     pub fn offset_to_bno(offset: u64) -> u64 {
         offset / BLOCK_SIZE
-    }
-
-    pub fn compress_into<'d>(&self, dest: &'d mut Vec<u8>) -> &'d [u8] {
-        let max_size = lz4_flex::block::get_maximum_output_size(self.data.len());
-        dest.resize(max_size, 0);
-        let written = lz4_flex::compress_into(&self.data, dest).expect("lz4 compress output too small");
-        log::debug!("compress {} result {}", self.data.len(), written);
-        &dest[..written]
     }
 
     pub fn start_offset(&self) -> u64 {
@@ -139,6 +227,7 @@ impl Block {
     pub fn copy_into(&self, dest: &mut Vec<u8>, offset: u64) -> usize {
         let rel_offset = offset.saturating_sub(self.start_offset()) as usize;
         let remaining = dest.capacity() - dest.len();
+        dbg!(remaining, self.data.len(), rel_offset);
         let max_write = cmp::min(remaining, self.data.len() - rel_offset);
         dest.extend_from_slice(&self.data[rel_offset..][..max_write]);
         max_write

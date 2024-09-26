@@ -20,6 +20,7 @@ scopeguard = "1.2.0"
 signal-hook = "0.3.17"
 simple_logger = "5.0.0"
 slab = "0.4.9"
+zstd = "0.13.2"
 
 [dev-dependencies]
 rand = "0.8.5"
