@@ -36,7 +36,7 @@ pub fn iter_blocks_from(
         let compression: Option<u8> = row.get(2)?;
         let block = CompressedBlock {
             ino,
-            bno,
+            bno: row.get(0)?,
             compression: compression.try_into()?,
             data,
         };
@@ -131,7 +131,7 @@ impl<'d> CompressedBlock<'d> {
                 buf
             }
             Compression::Zstd => {
-                let mut buf = vec![0u8; BLOCK_SIZE as usize];
+                let mut buf = Vec::with_capacity(BLOCK_SIZE as usize);
                 zstd::stream::copy_decode(self.data, &mut buf).expect("zstd decompress error");
                 log::debug!("Zstd decompress {} result {}", self.data.len(), buf.len());
                 buf.truncate(buf.len());
@@ -169,6 +169,17 @@ impl<'d> CompressedBlock<'d> {
             compression,
             data: &scratch[..],
         }
+    }
+}
+
+impl std::fmt::Debug for CompressedBlock<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompressedBlock")
+            .field("ino", &self.ino)
+            .field("bno", &self.bno)
+            .field("compression", &self.compression)
+            .field("data.len()", &self.data.len())
+            .finish()
     }
 }
 
@@ -210,7 +221,6 @@ impl Block {
         let avail = self.available();
         let data_len = u32::try_from(data.len()).expect("data size overflow");
         let max_write = cmp::min(avail, data_len) as usize;
-        log::debug!("extend max write {}", max_write);
         self.data.extend_from_slice(&data[..max_write]);
         u64::try_from(max_write).expect("written overflow")
     }
@@ -227,7 +237,6 @@ impl Block {
     pub fn copy_into(&self, dest: &mut Vec<u8>, offset: u64) -> usize {
         let rel_offset = offset.saturating_sub(self.start_offset()) as usize;
         let remaining = dest.capacity() - dest.len();
-        dbg!(remaining, self.data.len(), rel_offset);
         let max_write = cmp::min(remaining, self.data.len() - rel_offset);
         dest.extend_from_slice(&self.data[rel_offset..][..max_write]);
         max_write
@@ -253,7 +262,11 @@ impl std::fmt::Debug for Block {
 
 #[cfg(test)]
 mod tests {
+    use rand::RngCore;
     use test_log::test;
+
+    use crate::queries::block::CompressedBlock;
+    use crate::queries::block::Compression;
 
     use super::Block;
     use super::BLOCK_SIZE;
@@ -307,5 +320,65 @@ mod tests {
     fn test_block_offset_to_bno() {
         assert_eq!(Block::offset_to_bno(0), 0);
         assert_eq!(Block::offset_to_bno(BLOCK_SIZE), 1);
+    }
+
+    #[test]
+    fn test_none_compression() {
+        let mut rng = rand::thread_rng();
+
+        let mut b = Block::empty(0, 0);
+        b.data = vec![0; 1000];
+        rng.fill_bytes(&mut b.data);
+
+        let mut sratch = Vec::new();
+        let compressed_block: CompressedBlock<'_> = CompressedBlock::compress(&b, Compression::None, &mut sratch);
+        assert_eq!(b.data, compressed_block.data);
+
+        let decompressed_block = compressed_block.decompress();
+        assert_eq!(b.data, decompressed_block.data);
+    }
+
+    #[test]
+    fn test_lz4_compression() {
+        let mut rng = rand::thread_rng();
+
+        let mut b = Block::empty(0, 0);
+        b.data = vec![0; 1000];
+        rng.fill_bytes(&mut b.data);
+
+        let mut sratch = Vec::new();
+        let compressed = lz4_flex::compress(&b.data);
+        let compressed_block: CompressedBlock<'_> = CompressedBlock::compress(&b, Compression::LZ4, &mut sratch);
+
+        assert_eq!(compressed, compressed_block.data);
+
+        let decompressed_block = compressed_block.decompress();
+        let decompressed = lz4_flex::decompress(
+            &compressed[..],
+            lz4_flex::block::get_maximum_output_size(compressed.len()),
+        )
+        .unwrap();
+        assert_eq!(decompressed, decompressed_block.data);
+        assert_eq!(b.data, decompressed_block.data);
+    }
+
+    #[test]
+    fn test_zstd_compression() {
+        let mut rng = rand::thread_rng();
+
+        let mut b = Block::empty(0, 0);
+        b.data = vec![0; 1000];
+        rng.fill_bytes(&mut b.data);
+
+        let mut sratch = Vec::new();
+        let compressed = zstd::encode_all(&b.data[..], 0).unwrap();
+        let compressed_block = CompressedBlock::compress(&b, Compression::Zstd, &mut sratch);
+
+        assert_eq!(compressed, compressed_block.data);
+
+        let decompressed_block = compressed_block.decompress();
+        let decompressed = zstd::decode_all(&compressed[..]).unwrap();
+        assert_eq!(decompressed, decompressed_block.data);
+        assert_eq!(b.data, decompressed_block.data);
     }
 }

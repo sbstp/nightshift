@@ -3,7 +3,7 @@ use std::cmp;
 use crate::driver::OpenFlags;
 use crate::errors::Result;
 use crate::queries;
-use crate::queries::block::Compression;
+use crate::queries::block::{Block, Compression};
 
 const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
@@ -63,7 +63,11 @@ impl FileHandle {
         if self.buf.is_empty() {
             return Ok(());
         }
-        log::debug!("flush called, {} {}", self.buf.len(), self.buf.capacity());
+        log::debug!(
+            "Flush called, buf.len()={} buf.capacity()={}",
+            self.buf.len(),
+            self.buf.capacity()
+        );
 
         let mut attr = queries::inode::lookup(tx, self.ino)?;
         let mut new_offset = self.write_offset;
@@ -73,6 +77,13 @@ impl FileHandle {
         // Update blocks if the start offset overrides blocks.
         queries::block::iter_blocks_from(tx, self.ino, new_offset, |mut block| {
             let (written, diff) = block.write_at(new_offset, data);
+            log::debug!(
+                "Update block {} at offset={}, written={}, diff={}",
+                block.bno,
+                new_offset,
+                written,
+                diff
+            );
             data = &data[written as usize..];
             new_offset += written;
             attr.size = (attr.size as i64 + diff) as u64;
@@ -89,6 +100,13 @@ impl FileHandle {
         // Write the rest of the data in a new block.
         while !data.is_empty() {
             let written = queries::block::create(tx, self.ino, new_offset, data, self.compression)?;
+            log::debug!(
+                "Create block {} at offset={}, written={}, diff={}",
+                Block::offset_to_bno(new_offset),
+                new_offset,
+                written,
+                written
+            );
             data = &data[written as usize..];
             new_offset += written;
             attr.size += written;
