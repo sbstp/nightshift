@@ -119,11 +119,7 @@ pub struct CompressedBlock<'d> {
 impl<'d> CompressedBlock<'d> {
     pub fn decompress(self) -> Block {
         let buf = match self.compression {
-            Compression::None => {
-                let mut buf = self.data.to_owned();
-                buf.truncate(buf.len());
-                buf
-            }
+            Compression::None => self.data.to_owned(),
             Compression::LZ4 => {
                 let mut buf = vec![0u8; BLOCK_SIZE as usize];
                 let n = lz4_flex::decompress_into(self.data, &mut buf).expect("lz4 decompress output too small");
@@ -135,7 +131,6 @@ impl<'d> CompressedBlock<'d> {
                 let mut buf = Vec::with_capacity(BLOCK_SIZE as usize);
                 zstd::stream::copy_decode(self.data, &mut buf).expect("zstd decompress error");
                 log::debug!("Zstd decompress {} result {}", self.data.len(), buf.len());
-                buf.truncate(buf.len());
                 buf
             }
         };
