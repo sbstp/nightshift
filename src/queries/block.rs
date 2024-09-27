@@ -83,10 +83,11 @@ pub fn remove_blocks_from(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) ->
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, clap::ValueEnum)]
 #[repr(u8)]
 pub enum Compression {
     None = 0,
+    #[default]
     LZ4 = 1,
     Zstd = 2,
 }
