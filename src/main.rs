@@ -48,7 +48,7 @@ enum Commands {
         mount_path: PathBuf,
 
         #[arg(long = "compress", short = 'c', help = "Compression algorithm")]
-        compression: Compression,
+        compression: Option<Compression>,
 
         #[clap(flatten)]
         key_group: KeyGroup,
@@ -61,7 +61,7 @@ enum Commands {
         mount_path: PathBuf,
 
         #[arg(long = "compress", short = 'c', help = "Compression algorithm")]
-        compression: Compression,
+        compression: Option<Compression>,
 
         #[clap(flatten)]
         key_group: KeyGroup,
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             key_group,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db, compression);
+            let driver = FuseDriver::new(db, compression.unwrap_or_default());
 
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
@@ -151,7 +151,7 @@ fn main() -> anyhow::Result<()> {
             args,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db, compression);
+            let driver = FuseDriver::new(db, compression.unwrap_or_default());
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
                 // Umount & cleanup

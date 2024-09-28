@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_file_handle_flush() -> anyhow::Result<()> {
         let mut cx = rusqlite::Connection::open_in_memory()?;
-        cx.execute_batch(include_str!("../queries/sql/schema.sql"))?;
+        crate::database::migrate_database(&mut cx)?;
         let mut tx = cx.transaction()?;
 
         let mut attr = FileAttrBuilder::new_node(crate::types::FileType::RegularFile).build();
