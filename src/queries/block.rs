@@ -7,18 +7,21 @@ pub const BLOCK_SIZE: u64 = 128 * 1024;
 
 pub fn get_block(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) -> Result<Block> {
     let mut stmt = tx.prepare_cached("SELECT bno, data, compression FROM block WHERE ino = ? AND bno = ?")?;
-    let block = stmt.query_row(params![ino, bno], |row| {
-        let data = row.get_ref(1)?.as_blob()?;
-        let compression: Option<u8> = row.get(2)?;
-        let block = CompressedBlock {
-            ino,
-            bno,
-            compression: compression.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, // TODO: better error
-            data,
-        };
-        Ok(block.decompress())
-    })?;
-    Ok(block)
+    let mut rows = stmt.query(params![ino, bno])?;
+    match rows.next()? {
+        Some(row) => {
+            let data = row.get_ref(1)?.as_blob()?;
+            let compression: Option<u8> = row.get(2)?;
+            let block = CompressedBlock {
+                ino,
+                bno,
+                compression: compression.try_into()?,
+                data,
+            };
+            Ok(block.decompress())
+        }
+        None => Err(rusqlite::Error::QueryReturnedNoRows.into()),
+    }
 }
 
 pub fn iter_blocks_from(
