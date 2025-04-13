@@ -1,8 +1,10 @@
 #![allow(clippy::too_many_arguments)]
 
+mod buffer;
 mod database;
 mod driver;
 mod errors;
+mod offsets;
 mod queries;
 mod time;
 mod types;

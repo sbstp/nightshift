@@ -1,7 +1,11 @@
 use std::cmp;
 
+use bytes::BufMut;
+
+use crate::buffer::FixedBuffer;
 use crate::driver::OpenFlags;
 use crate::errors::Result;
+use crate::offsets::{Absolute, Relative};
 use crate::queries;
 use crate::queries::block::{Block, Compression};
 
@@ -14,9 +18,9 @@ pub struct FileHandle {
     #[allow(dead_code)]
     pub flags: OpenFlags,
     /// Stores the write position where buf must be written.
-    write_offset: u64,
+    write_offset: Absolute,
     /// Write data buffer used to optimize writes.
-    pub buf: Vec<u8>,
+    pub buf: FixedBuffer,
     compression: Compression,
 }
 
@@ -26,14 +30,14 @@ impl FileHandle {
             ino,
             size,
             flags,
-            write_offset: 0,
-            buf: Vec::with_capacity(BUFFER_SIZE),
+            write_offset: Absolute::from(0),
+            buf: FixedBuffer::with_capacity(BUFFER_SIZE),
             compression,
         }
     }
 
     fn buffer_remaining(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        self.buf.remaining_mut()
     }
 
     pub fn buffer_empty(&self) -> bool {
@@ -44,11 +48,11 @@ impl FileHandle {
         self.buffer_remaining() == 0
     }
 
-    pub fn write_offset(&self) -> u64 {
-        self.write_offset + self.buf.len() as u64
+    pub fn write_offset(&self) -> Absolute {
+        self.write_offset + Relative::from(self.buf.len())
     }
 
-    pub fn seek_to(&mut self, offset: u64) {
+    pub fn seek_to(&mut self, offset: Absolute) {
         assert_eq!(self.buf.len(), 0);
         self.write_offset = offset;
     }
@@ -126,8 +130,10 @@ impl FileHandle {
 
 #[cfg(test)]
 mod tests {
+    use crate::buffer::FixedBuffer;
     use crate::driver::attr::FileAttrBuilder;
     use crate::driver::{FileHandle, OpenFlags};
+    use crate::offsets::Absolute;
     use crate::queries;
     use crate::queries::block::{Compression, BLOCK_SIZE};
     use test_log::test;
@@ -138,8 +144,8 @@ mod tests {
             ino: 1,
             size: 10,
             flags: OpenFlags::from(0),
-            write_offset: 0,
-            buf: Vec::with_capacity(37),
+            write_offset: Absolute::from(0),
+            buf: FixedBuffer::with_capacity(37),
             compression: Compression::None,
         };
         assert_eq!(fh.buffer_remaining(), 37);
@@ -151,12 +157,12 @@ mod tests {
             ino: 1,
             size: 10,
             flags: OpenFlags::from(0),
-            write_offset: 0,
-            buf: vec![0; 37],
+            write_offset: Absolute::from(0),
+            buf: FixedBuffer::zeroed(37),
             compression: Compression::None,
         };
         assert!(fh.buffer_full());
-        fh.buf.reserve(10);
+        fh.buf.clear();
         assert!(!fh.buffer_full());
     }
 
@@ -166,11 +172,11 @@ mod tests {
             ino: 1,
             size: 10,
             flags: OpenFlags::from(0),
-            write_offset: 0,
-            buf: Vec::with_capacity(1000),
+            write_offset: Absolute::from(0),
+            buf: FixedBuffer::with_capacity(1000),
             compression: Compression::None,
         };
-        fh.seek_to(500);
+        fh.seek_to(500.into());
         assert_eq!(fh.write_offset(), 500);
     }
 
@@ -181,11 +187,11 @@ mod tests {
             ino: 1,
             size: 10,
             flags: OpenFlags::from(0),
-            write_offset: 0,
-            buf: vec![0; 37],
+            write_offset: Absolute::from(0),
+            buf: FixedBuffer::zeroed(37),
             compression: Compression::None,
         };
-        fh.seek_to(0);
+        fh.seek_to(0.into());
     }
 
     #[test]
@@ -194,8 +200,8 @@ mod tests {
             ino: 1,
             size: 10,
             flags: OpenFlags::from(0),
-            write_offset: 1000,
-            buf: Vec::with_capacity(64),
+            write_offset: Absolute::from(1000),
+            buf: FixedBuffer::with_capacity(64),
             compression: Compression::None,
         };
         assert_eq!(5, fh.consume_input(&[5; 5]));
@@ -222,7 +228,7 @@ mod tests {
         let mut total_size = 0;
         let mut block_num = 0;
 
-        queries::block::iter_blocks_from(&mut tx, attr.ino, 0, |block| {
+        queries::block::iter_blocks_from(&mut tx, attr.ino, Absolute::from(0), |block| {
             block_num += 1;
             total_size += block.data.len();
             Ok(true)
@@ -234,14 +240,14 @@ mod tests {
         //
         // Seek and overwrite
         //
-        fh.seek_to(BLOCK_SIZE / 2);
+        fh.seek_to((BLOCK_SIZE / 2).into());
         fh.consume_input(&[2u8; (BLOCK_SIZE * 2) as usize]);
         fh.flush(&mut tx)?;
 
         let mut total_size = 0;
         let mut block_num = 0;
 
-        queries::block::iter_blocks_from(&mut tx, attr.ino, 0, |block| {
+        queries::block::iter_blocks_from(&mut tx, attr.ino, Absolute::from(0), |block| {
             block_num += 1;
             total_size += block.data.len();
             Ok(true)

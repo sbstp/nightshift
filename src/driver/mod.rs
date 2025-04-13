@@ -6,7 +6,6 @@ mod handle;
 mod request_info;
 
 use std::{
-    cmp,
     ffi::OsStr,
     fs,
     os::unix::fs::MetadataExt,
@@ -15,15 +14,19 @@ use std::{
 };
 
 use attr::FileAttrBuilder;
+use bytes::BufMut;
 use fuser::FileAttr;
 use slab::Slab;
 
-use crate::queries::{self, block::Compression, dir_entry::ListDirEntry};
-use crate::types::FileType;
+use crate::{buffer::FixedBuffer, types::FileType};
 use crate::{database::DatabaseOps, time::TimeSpec};
 use crate::{
     errors::{Error, Result},
     queries::block::Block,
+};
+use crate::{
+    offsets::Absolute,
+    queries::{self, block::Compression, dir_entry::ListDirEntry},
 };
 pub use flags::OpenFlags;
 pub use handle::FileHandle;
@@ -128,7 +131,7 @@ impl FuseDriver {
             if let Some(gid) = gid {
                 queries::inode::set_attr(tx, ino, "gid", gid)?;
             }
-            if let Some(size) = size {
+            if let Some(size) = size.map(Absolute::from) {
                 let bno = Block::offset_to_bno(size);
                 queries::block::remove_blocks_from(tx, ino, bno + 1)?;
                 match queries::block::get_block(tx, ino, bno) {
@@ -139,7 +142,7 @@ impl FuseDriver {
                     Err(Error::NotFound) => {}
                     Err(e) => return Err(e),
                 }
-                queries::inode::set_attr(tx, ino, "size", size)?;
+                queries::inode::set_attr(tx, ino, "size", u64::from(size))?;
             }
             if let Some(atime) = atime {
                 queries::inode::set_attr(tx, ino, "atime_secs", atime.secs)?;
@@ -282,11 +285,11 @@ impl FuseDriver {
         _req: RequestInfo,
         ino: u64,
         fh: u64,
-        offset: i64,
+        offset: Absolute,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<FixedBuffer> {
         let fh = usize::try_from(fh).map_err(|_| Error::Overflow)?;
         let handle = self.handles.get_mut(fh).ok_or(Error::NotFound)?;
 
@@ -297,14 +300,13 @@ impl FuseDriver {
 
         self.db.with_read_tx(|tx| {
             let attr = queries::inode::lookup(tx, ino)?;
-            let offset = offset as u64;
-            let remaining = attr.size - offset;
-            let cap = cmp::min(size as u64, remaining) as usize;
-            let mut buf = Vec::with_capacity(cap);
+            let remaining = Absolute::from(attr.size) - offset;
+            let cap = remaining.min(size);
+            let mut buf = FixedBuffer::with_capacity(cap);
 
             queries::block::iter_blocks_from(tx, ino, offset, |block| {
                 block.copy_into(&mut buf, offset);
-                Ok(buf.len() < buf.capacity())
+                Ok(buf.has_remaining_mut())
             })?;
             assert!(buf.len() <= size as usize);
             Ok(buf)
@@ -316,7 +318,7 @@ impl FuseDriver {
         _req: RequestInfo,
         _ino: u64,
         fh: u64,
-        offset: i64,
+        offset: Absolute,
         mut data: &[u8],
         _write_flags: u32,
         _flags: i32,
@@ -325,7 +327,6 @@ impl FuseDriver {
         let fh = usize::try_from(fh).map_err(|_| Error::Overflow)?;
         let handle = self.handles.get_mut(fh).ok_or(Error::NotFound)?;
         let start_size = data.len();
-        let offset = offset as u64;
 
         // Detect if seek happened. If it did flush whatever is in the buffer
         // where it belongs and then update the offset where to write to.
@@ -600,7 +601,7 @@ impl fuser::Filesystem for FuseDriver {
         reply: fuser::ReplyData,
     ) {
         log::trace!("read(ino={}, offset={}, size={})", ino, offset, size);
-        let res = self.read_impl(req.into(), ino, fh, offset, size, flags, lock_owner);
+        let res = self.read_impl(req.into(), ino, fh, offset.into(), size, flags, lock_owner);
         log::trace!("read: {:?}", res.as_ref().map(|d| d.len()));
 
         match res {
@@ -623,7 +624,7 @@ impl fuser::Filesystem for FuseDriver {
         reply: fuser::ReplyWrite,
     ) {
         log::trace!("write(ino={}, offset={}, data_len={})", ino, offset, data.len());
-        let res = self.write_impl(req.into(), ino, fh, offset, data, write_flags, flags, lock_owner);
+        let res = self.write_impl(req.into(), ino, fh, offset.into(), data, write_flags, flags, lock_owner);
         log::trace!("write: {:?}", res);
 
         match res {
@@ -678,6 +679,7 @@ mod tests {
     use crate::{
         database::DatabaseOps,
         errors::Error,
+        offsets::Absolute,
         queries::{self, block::Compression},
         types::FileType,
     };
@@ -688,7 +690,7 @@ mod tests {
     fn count_blocks(driver: &mut FuseDriver, ino: u64) -> anyhow::Result<usize> {
         let mut block_count = 0;
         driver.db.with_read_tx(|tx| {
-            queries::block::iter_blocks_from(tx, ino, 0, |_| {
+            queries::block::iter_blocks_from(tx, ino, 0.into(), |_| {
                 block_count += 1;
                 Ok(true)
             })
@@ -775,7 +777,13 @@ mod tests {
             queries::inode::create(tx, &mut root_dir)?;
             queries::inode::create(tx, &mut node)?;
             queries::dir_entry::create(tx, root_dir.ino, OsStr::new("foo.txt"), node.ino)?;
-            queries::block::create(tx, node.ino, 0, b"hello world!", queries::block::Compression::Zstd)?;
+            queries::block::create(
+                tx,
+                node.ino,
+                0.into(),
+                b"hello world!",
+                queries::block::Compression::Zstd,
+            )?;
             Ok(())
         })?;
 
@@ -895,10 +903,19 @@ mod tests {
         })?;
 
         let (fh, _) = driver.open_impl(RequestInfo::default(), node.ino, OpenFlags::from(libc::O_RDWR))?;
-        driver.write_impl(RequestInfo::default(), node.ino, fh, 0, &[1u8; 200], 0, 0, None)?;
-        driver.write_impl(RequestInfo::default(), node.ino, fh, 200, &[2u8; 200], 0, 0, None)?;
+        driver.write_impl(RequestInfo::default(), node.ino, fh, 0.into(), &[1u8; 200], 0, 0, None)?;
+        driver.write_impl(
+            RequestInfo::default(),
+            node.ino,
+            fh,
+            200.into(),
+            &[2u8; 200],
+            0,
+            0,
+            None,
+        )?;
 
-        let data = driver.read_impl(RequestInfo::default(), node.ino, fh, 0, 400, 0, None)?;
+        let data = driver.read_impl(RequestInfo::default(), node.ino, fh, 0.into(), 400, 0, None)?;
         assert_eq!(data.len(), 400);
         assert_eq!(&data[..200], &[1u8; 200]);
         assert_eq!(&data[200..], &[2u8; 200]);
@@ -951,16 +968,14 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         for compression in [Compression::None, Compression::LZ4, Compression::Zstd] {
-            dbg!(compression);
-
             let db = DatabaseOps::open_in_memory()?;
             let mut driver = FuseDriver::new_no_io(db, compression);
 
             let attr = driver.mknod_impl(RequestInfo::default(), 1, OsStr::new("foo"), libc::S_IFREG, 0, 0)?;
             let (fh, _) = driver.open_impl(RequestInfo::default(), attr.ino, OpenFlags::from(libc::O_RDWR))?;
 
-            let max = 10 * 1024 * 1024;
-            let mut write_offset = 0;
+            let max = Absolute::from(10u64 * 1024 * 1024);
+            let mut write_offset = Absolute::from(0);
 
             let mut write_hasher = Sha1::new();
             let mut read_hahser = Sha1::new();
@@ -973,10 +988,10 @@ mod tests {
                 write_hasher.update(&buf);
                 driver.write_impl(RequestInfo::default(), attr.ino, fh, write_offset, &buf, 0, 0, None)?;
 
-                write_offset += buf.len() as i64;
+                write_offset += buf.len();
             }
 
-            let mut read_offset = 0;
+            let mut read_offset = Absolute::from(0);
 
             while read_offset < write_offset {
                 let size = rng.gen_range(1..130 * 1024);
@@ -984,7 +999,7 @@ mod tests {
 
                 read_hahser.update(&buf);
 
-                read_offset += size as i64;
+                read_offset += u64::from(size);
             }
 
             assert_eq!(write_hasher.finalize(), read_hahser.finalize());

@@ -1,6 +1,4 @@
-use std::cmp;
-
-use crate::errors::Result;
+use crate::{buffer::FixedBuffer, errors::Result, offsets::Absolute};
 use rusqlite::params;
 
 pub const BLOCK_SIZE: u64 = 128 * 1024;
@@ -27,7 +25,7 @@ pub fn get_block(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) -> Result<B
 pub fn iter_blocks_from(
     tx: &mut rusqlite::Transaction,
     ino: u64,
-    offset: u64,
+    offset: Absolute,
     mut iter: impl FnMut(Block) -> Result<bool>,
 ) -> Result<()> {
     let bno = Block::offset_to_bno(offset);
@@ -64,7 +62,7 @@ pub fn update(tx: &mut rusqlite::Transaction, block: &Block, compression: Compre
 pub fn create(
     tx: &mut rusqlite::Transaction,
     ino: u64,
-    offset: u64,
+    offset: Absolute,
     data: &[u8],
     compression: Compression,
 ) -> Result<u64> {
@@ -122,16 +120,20 @@ pub struct CompressedBlock<'d> {
 impl<'d> CompressedBlock<'d> {
     pub fn decompress(self) -> Block {
         let buf = match self.compression {
-            Compression::None => self.data.to_owned(),
+            Compression::None => {
+                let mut buf = FixedBuffer::with_capacity(BLOCK_SIZE as usize);
+                buf.extend_from_slice(self.data);
+                buf
+            }
             Compression::LZ4 => {
-                let mut buf = vec![0u8; BLOCK_SIZE as usize];
+                let mut buf = FixedBuffer::zeroed(BLOCK_SIZE as usize);
                 let n = lz4_flex::decompress_into(self.data, &mut buf).expect("lz4 decompress output too small");
                 log::debug!("LZ4 decompress {} result {}", self.data.len(), n);
                 buf.truncate(n);
                 buf
             }
             Compression::Zstd => {
-                let mut buf = Vec::with_capacity(BLOCK_SIZE as usize);
+                let mut buf = FixedBuffer::with_capacity(BLOCK_SIZE as usize);
                 zstd::stream::copy_decode(self.data, &mut buf).expect("zstd decompress error");
                 log::debug!("Zstd decompress {} result {}", self.data.len(), buf.len());
                 buf
@@ -188,7 +190,7 @@ pub struct Block {
     /// Block number.
     pub bno: u64,
     /// Block data. Always uncompressed.
-    pub data: Vec<u8>,
+    pub data: FixedBuffer,
 }
 
 impl Block {
@@ -196,54 +198,44 @@ impl Block {
         Block {
             ino,
             bno,
-            data: Vec::new(),
+            data: FixedBuffer::with_capacity(BLOCK_SIZE as usize),
         }
     }
 
-    pub fn offset_to_bno(offset: u64) -> u64 {
-        offset / BLOCK_SIZE
+    pub fn offset_to_bno(offset: impl Into<u64>) -> u64 {
+        offset.into() / BLOCK_SIZE
     }
 
-    pub fn start_offset(&self) -> u64 {
-        self.bno * BLOCK_SIZE
+    pub fn start_offset(&self) -> Absolute {
+        (self.bno * BLOCK_SIZE).into()
     }
 
-    pub fn end_offset(&self) -> u64 {
-        (self.bno + 1) * BLOCK_SIZE
-    }
-
-    fn available(&self) -> u32 {
-        u32::try_from(BLOCK_SIZE - self.data.len() as u64).expect("block size overflow")
+    pub fn end_offset(&self) -> Absolute {
+        ((self.bno + 1) * BLOCK_SIZE).into()
     }
 
     pub fn consume(&mut self, data: &[u8]) -> u64 {
-        let avail = self.available();
-        let data_len = u32::try_from(data.len()).expect("data size overflow");
-        let max_write = cmp::min(avail, data_len) as usize;
-        self.data.extend_from_slice(&data[..max_write]);
-        u64::try_from(max_write).expect("written overflow")
+        let cnt = self.data.extend_from_slice(data);
+        u64::try_from(cnt).expect("count overflow")
     }
 
-    pub fn write_at(&mut self, inode_offset: u64, data: &[u8]) -> (u64, i64) {
+    pub fn write_at(&mut self, inode_offset: Absolute, data: &[u8]) -> (u64, i64) {
         let start_len = self.data.len();
         let rel_offset = inode_offset - self.start_offset();
-        self.data.resize(rel_offset as usize, 0);
+        self.data.resize(rel_offset.into());
         let written = self.consume(data);
         let diff = self.data.len() as i64 - start_len as i64;
         (written, diff)
     }
 
-    pub fn copy_into(&self, dest: &mut Vec<u8>, offset: u64) -> usize {
-        let rel_offset = offset.saturating_sub(self.start_offset()) as usize;
-        let remaining = dest.capacity() - dest.len();
-        let max_write = cmp::min(remaining, self.data.len() - rel_offset);
-        dest.extend_from_slice(&self.data[rel_offset..][..max_write]);
-        max_write
+    pub fn copy_into(&self, dest: &mut FixedBuffer, offset: Absolute) -> usize {
+        let rel_offset = offset.saturating_sub(self.start_offset());
+        dest.extend_from_slice(&self.data[rel_offset.into()..])
     }
 
-    pub fn truncate(&mut self, inode_offset: u64) {
+    pub fn truncate(&mut self, inode_offset: Absolute) {
         let rel_size = inode_offset - self.start_offset();
-        self.data.truncate(rel_size as usize);
+        self.data.truncate(rel_size.into());
     }
 }
 
@@ -264,6 +256,8 @@ mod tests {
     use rand::RngCore;
     use test_log::test;
 
+    use crate::buffer::FixedBuffer;
+    use crate::offsets::Absolute;
     use crate::queries::block::CompressedBlock;
     use crate::queries::block::Compression;
 
@@ -276,7 +270,6 @@ mod tests {
         assert_eq!(b.ino, 37);
         assert_eq!(b.start_offset(), BLOCK_SIZE);
         assert_eq!(b.end_offset(), BLOCK_SIZE + BLOCK_SIZE);
-        assert_eq!(b.available(), BLOCK_SIZE as u32);
     }
 
     #[test]
@@ -291,33 +284,33 @@ mod tests {
     #[test]
     fn test_block_write_at() {
         let mut b = Block::empty(0, 1);
-        assert_eq!(b.write_at(BLOCK_SIZE, &[1; 5]), (5, 5));
-        assert_eq!(b.data, vec![1; 5]);
+        assert_eq!(b.write_at(BLOCK_SIZE.into(), &[1; 5]), (5, 5));
+        assert_eq!(b.data.as_ref(), [1; 5]);
 
         let mut b = Block::empty(0, 1);
-        assert_eq!(b.write_at(BLOCK_SIZE + 5, &[1; 5]), (5, 10));
-        assert_eq!(b.data, vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+        assert_eq!(b.write_at(Absolute::from(BLOCK_SIZE + 5), &[1; 5]), (5, 10));
+        assert_eq!(b.data.as_ref(), [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
     }
 
     #[test]
     fn test_block_copy_into() {
         let mut b = Block::empty(0, 0);
-        b.data = (1u8..=10).collect();
+        b.data.extend(1u8..=10);
 
-        let mut buf = Vec::with_capacity(5);
-        assert_eq!(b.copy_into(&mut buf, 0), 5);
+        let mut buf = FixedBuffer::with_capacity(5);
+        assert_eq!(b.copy_into(&mut buf, 0.into()), 5);
 
-        let mut buf = Vec::with_capacity(15);
-        assert_eq!(b.copy_into(&mut buf, 0), 10);
+        let mut buf = FixedBuffer::with_capacity(15);
+        assert_eq!(b.copy_into(&mut buf, 0.into()), 10);
 
-        let mut buf = Vec::with_capacity(5);
-        assert_eq!(b.copy_into(&mut buf, 5), 5);
-        assert_eq!(buf, &[6, 7, 8, 9, 10]);
+        let mut buf = FixedBuffer::with_capacity(5);
+        assert_eq!(b.copy_into(&mut buf, 5.into()), 5);
+        assert_eq!(&buf[..], &[6, 7, 8, 9, 10]);
     }
 
     #[test]
     fn test_block_offset_to_bno() {
-        assert_eq!(Block::offset_to_bno(0), 0);
+        assert_eq!(Block::offset_to_bno(0u32), 0);
         assert_eq!(Block::offset_to_bno(BLOCK_SIZE), 1);
     }
 
@@ -326,12 +319,12 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let mut b = Block::empty(0, 0);
-        b.data = vec![0; 1000];
+        b.data = FixedBuffer::zeroed(1000);
         rng.fill_bytes(&mut b.data);
 
         let mut sratch = Vec::new();
         let compressed_block: CompressedBlock<'_> = CompressedBlock::compress(&b, Compression::None, &mut sratch);
-        assert_eq!(b.data, compressed_block.data);
+        assert_eq!(b.data.as_ref(), compressed_block.data);
 
         let decompressed_block = compressed_block.decompress();
         assert_eq!(b.data, decompressed_block.data);
@@ -342,7 +335,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let mut b = Block::empty(0, 0);
-        b.data = vec![0; 1000];
+        b.data = FixedBuffer::zeroed(1000);
         rng.fill_bytes(&mut b.data);
 
         let mut sratch = Vec::new();
@@ -357,7 +350,7 @@ mod tests {
             lz4_flex::block::get_maximum_output_size(compressed.len()),
         )
         .unwrap();
-        assert_eq!(decompressed, decompressed_block.data);
+        assert_eq!(&decompressed[..], decompressed_block.data.as_ref());
         assert_eq!(b.data, decompressed_block.data);
     }
 
@@ -366,7 +359,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let mut b = Block::empty(0, 0);
-        b.data = vec![0; 1000];
+        b.data = FixedBuffer::zeroed(1000);
         rng.fill_bytes(&mut b.data);
 
         let mut sratch = Vec::new();
@@ -377,7 +370,7 @@ mod tests {
 
         let decompressed_block = compressed_block.decompress();
         let decompressed = zstd::decode_all(&compressed[..]).unwrap();
-        assert_eq!(decompressed, decompressed_block.data);
+        assert_eq!(&decompressed[..], decompressed_block.data.as_ref());
         assert_eq!(b.data, decompressed_block.data);
     }
 }
