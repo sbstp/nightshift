@@ -85,7 +85,7 @@ enum Commands {
 }
 
 #[derive(Debug, clap::Args)]
-#[group(required = true, multiple = false)]
+#[group(multiple = false)]
 struct KeyGroup {
     #[arg(long, help = "Decryption key")]
     key: Option<String>,
@@ -95,21 +95,21 @@ struct KeyGroup {
 }
 
 impl KeyGroup {
-    fn read_key(self) -> anyhow::Result<String> {
+    fn read_key(self) -> anyhow::Result<Option<String>> {
         let key = if let Some(key) = self.key {
             key
         } else if let Some(key_file) = self.key_file {
             let raw_key = fs::read_to_string(key_file)?;
             raw_key.trim_end().to_owned()
         } else {
-            bail!("One of --key or --key-file is required");
+            return Ok(None);
         };
 
         if key.is_empty() {
             bail!("Key cannot be empty");
         }
 
-        Ok(key)
+        Ok(Some(key))
     }
 }
 
@@ -128,7 +128,8 @@ fn main() -> anyhow::Result<()> {
             compression,
             key_group,
         } => {
-            let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
+            let key = key_group.read_key()?;
+            let db = DatabaseOps::open(&database_path, key).context("open db")?;
             let driver = FuseDriver::new(db, compression.unwrap_or_default(), &mount_path)?;
 
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
@@ -152,7 +153,8 @@ fn main() -> anyhow::Result<()> {
             cmd,
             args,
         } => {
-            let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
+            let key = key_group.read_key()?;
+            let db = DatabaseOps::open(&database_path, key).context("open db")?;
             let driver = FuseDriver::new(db, compression.unwrap_or_default(), &mount_path)?;
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
@@ -184,7 +186,8 @@ fn main() -> anyhow::Result<()> {
             database_path,
             key_group,
         } => {
-            let mut db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
+            let key = key_group.read_key()?;
+            let mut db = DatabaseOps::open(&database_path, key).context("open db")?;
             println!("Running VACUUM on database, this may take a few seconds...");
             db.vacuum()?;
             println!("Done!");
