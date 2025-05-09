@@ -16,9 +16,11 @@ pub struct DatabaseOps {
 }
 
 impl DatabaseOps {
-    pub fn open(path: &Path, key: String) -> anyhow::Result<Self> {
+    pub fn open(path: &Path, key: Option<String>) -> anyhow::Result<Self> {
         let mut db = rusqlite::Connection::open(path).context("open")?;
-        set_cipher_key(&db, key)?;
+        if let Some(key) = key {
+            set_cipher_key(&db, key)?;
+        }
         migrate_database(&mut db)?;
         Ok(DatabaseOps { db })
     }
