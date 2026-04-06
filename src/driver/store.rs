@@ -16,7 +16,7 @@ use crate::{
     time::TimeSpec,
 };
 
-use super::{attr::FileAttrBuilder, handle::FileHandle};
+use super::{attr::FileAttrBuilder, handle::{FileHandle, Handle}, OpenFlags};
 
 pub struct SetAttr {
     pub mode: Option<u32>,
@@ -31,6 +31,8 @@ pub struct SetAttr {
 }
 
 pub trait Store {
+    type Handle: Handle;
+
     fn ensure_root(&mut self) -> Result<()>;
     fn lookup_entry(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr>;
     fn get_inode(&mut self, ino: u64) -> Result<FileAttr>;
@@ -43,12 +45,15 @@ pub trait Store {
     fn list_dir<F>(&mut self, ino: u64, offset: i64, iter: F) -> Result<()>
     where
         F: FnMut(ListDirEntry) -> bool;
-    fn flush_handle(&mut self, handle: &mut FileHandle) -> Result<()>;
+    fn open_handle(&mut self, ino: u64, flags: OpenFlags, compression: Compression) -> Result<Self::Handle>;
+    fn flush_handle(&mut self, handle: &mut Self::Handle) -> Result<()>;
     fn read_file(&mut self, ino: u64, offset: Absolute, size: u32) -> Result<FixedBuffer>;
     fn rename_entry(&mut self, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr) -> Result<()>;
 }
 
 impl Store for DatabaseOps {
+    type Handle = FileHandle;
+
     fn ensure_root(&mut self) -> Result<()> {
         self.with_write_tx(|tx| match queries::inode::lookup(tx, 1) {
             Err(Error::NotFound) => {
@@ -185,7 +190,12 @@ impl Store for DatabaseOps {
         })
     }
 
-    fn flush_handle(&mut self, handle: &mut FileHandle) -> Result<()> {
+    fn open_handle(&mut self, ino: u64, flags: OpenFlags, compression: Compression) -> Result<Self::Handle> {
+        let attr = self.get_inode(ino)?;
+        Ok(FileHandle::new(ino, attr.size, flags, compression))
+    }
+
+    fn flush_handle(&mut self, handle: &mut Self::Handle) -> Result<()> {
         self.with_write_tx(|tx| handle.flush(tx))
     }
 

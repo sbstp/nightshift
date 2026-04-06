@@ -11,6 +11,14 @@ use crate::queries::block::{Block, Compression};
 
 const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
+pub trait Handle {
+    fn buffer_empty(&self) -> bool;
+    fn buffer_full(&self) -> bool;
+    fn write_offset(&self) -> Absolute;
+    fn seek_to(&mut self, offset: Absolute);
+    fn consume_input(&mut self, buf: &[u8]) -> usize;
+}
+
 #[derive(Debug)]
 pub struct FileHandle {
     pub ino: u64,
@@ -36,34 +44,7 @@ impl FileHandle {
         }
     }
 
-    fn buffer_remaining(&self) -> usize {
-        self.buf.remaining_mut()
-    }
-
-    pub fn buffer_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
-
-    pub fn buffer_full(&self) -> bool {
-        self.buffer_remaining() == 0
-    }
-
-    pub fn write_offset(&self) -> Absolute {
-        self.write_offset + Relative::from(self.buf.len())
-    }
-
-    pub fn seek_to(&mut self, offset: Absolute) {
-        assert_eq!(self.buf.len(), 0);
-        self.write_offset = offset;
-    }
-
-    pub fn consume_input(&mut self, buf: &[u8]) -> usize {
-        let write = cmp::min(buf.len(), self.buffer_remaining());
-        self.buf.extend_from_slice(&buf[..write]);
-        write
-    }
-
-    pub fn flush(&mut self, tx: &mut rusqlite::Transaction) -> Result<()> {
+    pub(in crate::driver) fn flush(&mut self, tx: &mut rusqlite::Transaction) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -128,11 +109,38 @@ impl FileHandle {
     }
 }
 
+impl Handle for FileHandle {
+    fn buffer_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn buffer_full(&self) -> bool {
+        self.buf.remaining_mut() == 0
+    }
+
+    fn write_offset(&self) -> Absolute {
+        self.write_offset + Relative::from(self.buf.len())
+    }
+
+    fn seek_to(&mut self, offset: Absolute) {
+        assert_eq!(self.buf.len(), 0);
+        self.write_offset = offset;
+    }
+
+    fn consume_input(&mut self, buf: &[u8]) -> usize {
+        let write = cmp::min(buf.len(), self.buf.remaining_mut());
+        self.buf.extend_from_slice(&buf[..write]);
+        write
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use bytes::BufMut;
     use crate::buffer::FixedBuffer;
     use crate::driver::attr::FileAttrBuilder;
-    use crate::driver::{FileHandle, OpenFlags};
+    use crate::driver::OpenFlags;
+    use super::{FileHandle, Handle};
     use crate::offsets::Absolute;
     use crate::queries;
     use crate::queries::block::{Compression, BLOCK_SIZE};
@@ -148,7 +156,7 @@ mod tests {
             buf: FixedBuffer::with_capacity(37),
             compression: Compression::None,
         };
-        assert_eq!(fh.buffer_remaining(), 37);
+        assert_eq!(fh.buf.remaining_mut(), 37);
     }
 
     #[test]
