@@ -8,6 +8,7 @@ mod offsets;
 mod queries;
 mod time;
 mod types;
+mod vfs;
 
 use std::{
     fs,

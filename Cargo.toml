@@ -7,12 +7,14 @@ edition = "2021"
 anyhow = "1.0.86"
 bytes = "1.10.1"
 clap = { version = "4.5.15", features = ["derive"] }
+derive_more = { version = "2.1.1", features = ["into", "from"] }
 fuser = { version = "0.14.0", default-features = false, features = [
     "abi-7-10",
 ] }
 libc = "0.2.155"
 log = "0.4.22"
 lz4_flex = "0.11.3"
+parking_lot = "0.12.5"
 rusqlite = { version = "0.32.1", features = [
     # "bundled",
     "bundled-sqlcipher-vendored-openssl",
