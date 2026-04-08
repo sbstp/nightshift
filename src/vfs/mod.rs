@@ -4,30 +4,9 @@ use bytes::Bytes;
 use derive_more::{From, Into};
 use fuser::FileAttr;
 
+use crate::driver::OpenFlags;
+
 pub mod write_behind;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    NotEmpty,
-    NotFound,
-    InvalidArgument,
-    Overflow,
-    Other(String),
-    InvalidCompression,
-}
-
-impl Error {
-    pub fn errno(self) -> libc::c_int {
-        match self {
-            Error::NotEmpty => libc::ENOTEMPTY,
-            Error::NotFound => libc::ENOENT,
-            Error::InvalidArgument => libc::EINVAL,
-            Error::Overflow => libc::EOVERFLOW,
-            Error::InvalidCompression => libc::EINVAL,
-            Error::Other(_) => libc::ENOTSUP, // Need better code
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, From, Into, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ino(u64);
@@ -35,21 +14,36 @@ pub struct Ino(u64);
 #[derive(Debug, Clone, Copy, From, Into, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fno(u64);
 
-pub trait Vfs {
+impl From<usize> for Fno {
+    fn from(value: usize) -> Self {
+        Self(value.try_into().expect("fno out of range"))
+    }
+}
+
+impl From<Fno> for usize {
+    fn from(value: Fno) -> Self {
+        value.0.try_into().expect("fno out of range")
+    }
+}
+
+pub trait Vfs: Clone + Send + Sync {
     type Handle: VfsHandle;
+    type Error;
 
-    fn ensure_root(&self) -> Result<(), Error>;
-    fn lookup_name(&self, parent: Ino, name: &OsStr) -> Result<FileAttr, Error>;
-    fn lookup_ino(&self, ino: Ino) -> Result<FileAttr, Error>;
+    fn ensure_root(&self) -> Result<(), Self::Error>;
+    fn lookup_name(&self, parent: Ino, name: &OsStr) -> Result<FileAttr, Self::Error>;
+    fn lookup_ino(&self, ino: Ino) -> Result<FileAttr, Self::Error>;
 
-    fn open(&self, ino: Ino, flags: usize) -> Result<Self::Handle, Error>;
-    fn close(&self, fno: Fno) -> Result<(), Error>;
+    fn open(&self, ino: Ino, flags: OpenFlags) -> Result<Self::Handle, Self::Error>;
+    fn close(&self, fno: Fno) -> Result<(), Self::Error>;
     fn handle(&self, fno: Fno) -> Option<Self::Handle>;
 }
 
-pub trait VfsHandle: Clone + Sized {
+pub trait VfsHandle: Clone + Send + Sync {
+    type Error;
+
     fn fno(&self) -> Fno;
-    fn read(&self, offset: u64, size: u32) -> Result<Bytes, Error>;
-    fn write(&self, offset: u64, data: &[u8]) -> Result<(), Error>;
-    fn flush(&self) -> Result<(), Error>;
+    fn read(&self, offset: u64, size: u32) -> Result<Bytes, Self::Error>;
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
+    fn flush(&self) -> Result<(), Self::Error>;
 }

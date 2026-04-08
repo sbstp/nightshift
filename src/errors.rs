@@ -10,6 +10,7 @@ pub enum Error {
     Overflow,
     Other(String),
     InvalidCompression,
+    Timeout,
 }
 
 impl Error {
@@ -20,6 +21,7 @@ impl Error {
             Error::InvalidArgument => libc::EINVAL,
             Error::Overflow => libc::EOVERFLOW,
             Error::InvalidCompression => libc::EINVAL,
+            Error::Timeout => libc::ETIMEDOUT,
             Error::Other(_) => libc::ENOTSUP, // Need better code
         }
     }
@@ -40,6 +42,12 @@ impl From<FromSqlError> for Error {
     }
 }
 
+impl From<r2d2::Error> for Error {
+    fn from(_: r2d2::Error) -> Self {
+        Error::Timeout
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -48,6 +56,7 @@ impl std::fmt::Display for Error {
             Error::InvalidArgument => write!(f, "Invalid Argument"),
             Error::Overflow => write!(f, "Overflow"),
             Error::InvalidCompression => write!(f, "Invalid Compression Scheme"),
+            Error::Timeout => write!(f, "Timeout"),
             Error::Other(msg) => write!(f, "Other: {}", msg),
         }
     }

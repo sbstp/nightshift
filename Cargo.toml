@@ -15,9 +15,12 @@ libc = "0.2.155"
 log = "0.4.22"
 lz4_flex = "0.11.3"
 parking_lot = "0.12.5"
-rusqlite = { version = "0.32.1", features = [
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.33.0"
+rusqlite = { version = "0.39.0", features = [
     # "bundled",
     "bundled-sqlcipher-vendored-openssl",
+    "fallible_uint",
 ] }
 scopeguard = "1.2.0"
 signal-hook = "0.3.17"
