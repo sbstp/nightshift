@@ -26,6 +26,9 @@ impl From<Fno> for usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, From, Into, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bno(u64);
+
 pub trait Vfs: Clone + Send + Sync {
     type Handle: VfsHandle;
     type Error;

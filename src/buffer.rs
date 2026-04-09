@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug)]
 pub struct FixedBuffer {
@@ -48,6 +48,10 @@ impl FixedBuffer {
 
     pub fn clear(&mut self) {
         self.inner.clear();
+    }
+
+    pub fn freeze(self) -> Bytes {
+        self.inner.freeze()
     }
 }
 

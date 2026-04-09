@@ -1,4 +1,5 @@
 use crate::{buffer::FixedBuffer, errors::Result, offsets::Absolute};
+use bytes::Bytes;
 use rusqlite::params;
 
 pub const BLOCK_SIZE: u64 = 128 * 1024;

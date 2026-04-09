@@ -4,21 +4,53 @@ use std::{
     sync::Arc,
 };
 
+use bytes::{Bytes, BytesMut};
 use fuser::FileAttr;
 use parking_lot::Mutex;
+use quick_cache::sync::{Cache, EntryAction, EntryResult};
 use slab::Slab;
+use zstd::zstd_safe::WriteBuf;
 
-use crate::{database::DatabaseOps, driver::OpenFlags, queries};
+use crate::queries::block::Block as BaseBlock;
+use crate::{database::DatabaseOps, driver::OpenFlags, queries, vfs::Bno};
 
 use super::{Fno, Ino, Vfs, VfsHandle};
+
+#[derive(Clone)]
+struct Block {
+    ino: Ino,
+    bno: Bno,
+    buf: Bytes,
+}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Block")
+            .field("ino", &self.ino)
+            .field("bno", &self.bno)
+            .field("buf.len()", &self.buf.len())
+            .field("buf.cap()", &self.buf.capacity())
+            .finish()
+    }
+}
+
+impl From<queries::block::Block> for Block {
+    fn from(value: queries::block::Block) -> Self {
+        Self {
+            ino: value.ino.into(),
+            bno: value.bno.into(),
+            buf: value.data.freeze(),
+        }
+    }
+}
 
 struct WriteBehindCore {
     //db: DatabaseOps, // todo use connection pool
     pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>,
-    nodes: parking_lot::RwLock<BTreeMap<Ino, FileAttr>>,
-    entries: parking_lot::RwLock<HashMap<OsString, Ino>>,
+    nodes: Cache<Ino, FileAttr>,
+    entries: Cache<OsString, Ino>,
+    blocks: Cache<(Ino, Bno), Block>,
     handles: parking_lot::RwLock<Slab<WriteBehindHandle>>,
-    read_lock: Mutex<()>, // todo striped lock
 }
 
 #[derive(Clone)]
@@ -29,11 +61,60 @@ struct WriteBehind {
 #[derive(Clone)]
 struct WriteBehindHandle {
     fno: Fno,
+    ino: Ino,
     core: Arc<WriteBehindCore>,
     flags: OpenFlags,
 }
 
-impl WriteBehind {}
+impl WriteBehindCore {
+    fn load_ino(&self, ino: Ino) -> Result<fuser::FileAttr, crate::errors::Error> {
+        let result = self.nodes.entry(&ino, None, |_, v| EntryAction::Retain(*v));
+        let attr = match result {
+            EntryResult::Vacant(placeholder) => {
+                let mut conn = self.pool.get()?;
+                let mut tx = conn.transaction()?;
+                let attr = queries::inode::lookup(&mut tx, ino.0)?;
+                placeholder.insert(attr).expect("no insert failure");
+                attr
+            }
+            EntryResult::Retained(attr) => attr,
+            _ => unreachable!(),
+        };
+        Ok(attr)
+    }
+
+    fn load_entry(&self, parent: Ino, name: &OsStr) -> Result<Ino, crate::errors::Error> {
+        let result = self.entries.entry(name, None, |_, v| EntryAction::Retain(*v));
+        let attr = match result {
+            EntryResult::Vacant(placeholder) => {
+                let mut conn = self.pool.get()?;
+                let mut tx = conn.transaction()?;
+                let ino: Ino = queries::dir_entry::lookup(&mut tx, parent.into(), name).map(Into::into)?;
+                placeholder.insert(ino).expect("no insert failure");
+                ino
+            }
+            EntryResult::Retained(ino) => ino,
+            _ => unreachable!(),
+        };
+        Ok(attr)
+    }
+
+    fn load_block(&self, ino: Ino, bno: Bno) -> Result<Block, crate::errors::Error> {
+        let result = self.blocks.entry(&(ino, bno), None, |_, v| EntryAction::Retain(*v));
+        let block = match result {
+            EntryResult::Vacant(placeholder) => {
+                let mut conn = self.pool.get()?;
+                let mut tx = conn.transaction()?;
+                let block: Block = queries::block::get_block(&mut tx, ino.into(), bno.into()).map(Into::into)?;
+                placeholder.insert(block.clone()).expect("no insert failure");
+                block
+            }
+            EntryResult::Retained(block) => block,
+            _ => unreachable!(),
+        };
+        Ok(block)
+    }
+}
 
 impl Vfs for WriteBehind {
     type Handle = WriteBehindHandle;
@@ -44,40 +125,18 @@ impl Vfs for WriteBehind {
     }
 
     fn lookup_name(&self, parent: super::Ino, name: &OsStr) -> Result<fuser::FileAttr, Self::Error> {
-        let _read_guard = self.core.read_lock.lock();
-        let ino = match self.core.entries.read().get(name).copied() {
-            Some(ino) => ino,
-            None => {
-                // Either the entry does not exist or has no been loaded yet, try to load it.
-                let mut conn = self.core.pool.get()?;
-                let mut tx = conn.transaction()?;
-                let ino = queries::dir_entry::lookup(&mut tx, parent.0, name)?;
-                self.core.entries.write().insert(name.to_owned(), ino.into());
-                ino.into()
-            }
-        };
-        self.lookup_ino(ino)
+        self.core.load_entry(parent, name).and_then(|ino| self.load_ino(ino))
     }
 
     fn lookup_ino(&self, ino: super::Ino) -> Result<fuser::FileAttr, Self::Error> {
-        let _read_guard = self.core.read_lock.lock();
-        match self.core.nodes.read().get(&ino).copied() {
-            Some(attr) => Ok(attr),
-            None => {
-                // Either the node does not exist or has no been loaded yet, try to load it.
-                let mut conn = self.core.pool.get()?;
-                let mut tx = conn.transaction()?;
-                let inode = queries::inode::lookup(&mut tx, ino.0)?;
-                self.core.nodes.write().insert(ino, inode);
-                Ok(inode)
-            }
-        }
+        self.core.load_ino(ino)
     }
 
     fn open(&self, ino: super::Ino, flags: OpenFlags) -> Result<Self::Handle, Self::Error> {
         self.lookup_ino(ino)?;
         let handle = WriteBehindHandle {
             fno: 0u64.into(), // generated by slab
+            ino,
             core: self.core.clone(),
             flags,
         };
@@ -108,7 +167,21 @@ impl VfsHandle for WriteBehindHandle {
     }
 
     fn read(&self, offset: u64, size: u32) -> Result<bytes::Bytes, Self::Error> {
-        todo!()
+        let size = size.try_into().expect("out of range");
+        let mut buf = BytesMut::with_capacity(size);
+        while size - buf.len() > 0 {
+            let block = match self
+                .core
+                .load_block(self.ino, BaseBlock::offset_to_bno(offset + buf.len() as u64).into())
+            {
+                Ok(b) => b,
+                Err(crate::errors::Error::NotFound) => break,
+                Err(e) => return Err(e),
+            };
+            let copy_len = std::cmp::min(size - buf.len(), block.buf.len());
+            buf.extend_from_slice(&block.buf[..copy_len]);
+        }
+        Ok(buf.freeze())
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
