@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
-    sync::Arc,
+    sync::{mpsc, Arc},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -51,6 +51,7 @@ struct WriteBehindCore {
     entries: Cache<OsString, Ino>,
     blocks: Cache<(Ino, Bno), Block>,
     handles: parking_lot::RwLock<Slab<WriteBehindHandle>>,
+    write_tx: mpsc::Sender<Block>,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,74 @@ struct WriteBehindHandle {
     ino: Ino,
     core: Arc<WriteBehindCore>,
     flags: OpenFlags,
+}
+
+fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx: mpsc::Receiver<Block>) {
+    std::thread::spawn(move || loop {
+        todo!()
+    });
+}
+
+fn flush_batch(pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, batch: &[Block]) {
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("write-behind: failed to get db connection: {e}");
+            return;
+        }
+    };
+    let mut tx = match conn.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("write-behind: failed to start transaction: {e}");
+            return;
+        }
+    };
+    for block in batch {
+        if let Err(e) = queries::block::upsert(
+            &mut tx,
+            block.ino.into(),
+            block.bno.into(),
+            &block.buf,
+            Default::default(),
+        ) {
+            log::error!(
+                "write-behind: upsert failed for ino={} bno={}: {e}",
+                block.ino.0,
+                block.bno.0
+            );
+        }
+    }
+    if let Err(e) = tx.commit() {
+        log::error!("write-behind: commit failed: {e}");
+    }
+}
+
+impl WriteBehind {
+    #[cfg(test)]
+    pub fn new_for_test() -> anyhow::Result<Self> {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager)?;
+
+        {
+            let mut conn = pool.get()?;
+            crate::database::migrate_database(&mut conn)?;
+        }
+
+        let (write_tx, write_rx) = mpsc::channel::<Block>();
+        spawn_write_thread(pool.clone(), write_rx);
+
+        Ok(WriteBehind {
+            core: Arc::new(WriteBehindCore {
+                pool,
+                nodes: Cache::new(128),
+                entries: Cache::new(128),
+                blocks: Cache::new(256),
+                handles: parking_lot::RwLock::new(Slab::new()),
+                write_tx,
+            }),
+        })
+    }
 }
 
 impl WriteBehindCore {
@@ -100,7 +169,9 @@ impl WriteBehindCore {
     }
 
     fn load_block(&self, ino: Ino, bno: Bno) -> Result<Block, crate::errors::Error> {
-        let result = self.blocks.entry(&(ino, bno), None, |_, v| EntryAction::Retain(*v));
+        let result = self
+            .blocks
+            .entry(&(ino, bno), None, |_, v| EntryAction::Retain(v.clone()));
         let block = match result {
             EntryResult::Vacant(placeholder) => {
                 let mut conn = self.pool.get()?;
@@ -125,7 +196,9 @@ impl Vfs for WriteBehind {
     }
 
     fn lookup_name(&self, parent: super::Ino, name: &OsStr) -> Result<fuser::FileAttr, Self::Error> {
-        self.core.load_entry(parent, name).and_then(|ino| self.load_ino(ino))
+        self.core
+            .load_entry(parent, name)
+            .and_then(|ino| self.core.load_ino(ino))
     }
 
     fn lookup_ino(&self, ino: super::Ino) -> Result<fuser::FileAttr, Self::Error> {
@@ -148,7 +221,7 @@ impl Vfs for WriteBehind {
     }
 
     fn close(&self, fno: super::Fno) -> Result<(), Self::Error> {
-        let h = self.handle(fno).ok_or_else(|| crate::errors::Error::NotFound)?;
+        let h = self.handle(fno).ok_or(crate::errors::Error::NotFound)?;
         h.flush()?;
         self.core.handles.write().remove(fno.into());
         Ok(())
@@ -167,28 +240,126 @@ impl VfsHandle for WriteBehindHandle {
     }
 
     fn read(&self, offset: u64, size: u32) -> Result<bytes::Bytes, Self::Error> {
-        let size = size.try_into().expect("out of range");
+        let size = size as usize;
         let mut buf = BytesMut::with_capacity(size);
-        while size - buf.len() > 0 {
-            let block = match self
-                .core
-                .load_block(self.ino, BaseBlock::offset_to_bno(offset + buf.len() as u64).into())
-            {
+
+        for seg in BaseBlock::segments(offset, size) {
+            let block = match self.core.load_block(self.ino, seg.bno.into()) {
                 Ok(b) => b,
                 Err(crate::errors::Error::NotFound) => break,
                 Err(e) => return Err(e),
             };
-            let copy_len = std::cmp::min(size - buf.len(), block.buf.len());
-            buf.extend_from_slice(&block.buf[..copy_len]);
+            if seg.rel_offset >= block.buf.len() {
+                break;
+            }
+            let copy_len = (block.buf.len() - seg.rel_offset).min(seg.len);
+            buf.extend_from_slice(&block.buf[seg.rel_offset..seg.rel_offset + copy_len]);
         }
+
         Ok(buf.freeze())
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        todo!()
+        for seg in BaseBlock::segments(offset, data.len()) {
+            // RMW: load existing block from cache/DB, or start with empty bytes
+            let existing_buf = match self.core.load_block(self.ino, seg.bno.into()) {
+                Ok(b) => b.buf,
+                Err(crate::errors::Error::NotFound) => Bytes::new(),
+                Err(e) => return Err(e),
+            };
+
+            let required_len = seg.rel_offset + seg.len;
+            let mut buf = BytesMut::from(existing_buf);
+            if buf.len() < required_len {
+                buf.resize(required_len, 0);
+            }
+            buf[seg.rel_offset..required_len].copy_from_slice(&data[seg.data_offset..seg.data_offset + seg.len]);
+
+            let updated = Block {
+                ino: self.ino,
+                bno: seg.bno.into(),
+                buf: buf.freeze(),
+            };
+            self.core.blocks.insert((self.ino, seg.bno.into()), updated.clone());
+            let _ = self.core.write_tx.send(updated);
+        }
+
+        Ok(())
     }
 
     fn flush(&self) -> Result<(), Self::Error> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl WriteBehind {
+        #[cfg(test)]
+        fn insert_test_file(&self) -> Ino {
+            let mut conn = self.core.pool.get().unwrap();
+            let mut tx = conn.transaction().unwrap();
+            let mut attr = fuser::FileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: std::time::UNIX_EPOCH,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                crtime: std::time::UNIX_EPOCH,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            };
+            queries::inode::create(&mut tx, &mut attr).unwrap();
+            tx.commit().unwrap();
+            attr.ino.into()
+        }
+    }
+
+    fn open_test_handle() -> (WriteBehind, WriteBehindHandle) {
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let ino = vfs.insert_test_file();
+        let handle = vfs.open(ino, OpenFlags::from(libc::O_RDWR)).unwrap();
+        (vfs, handle)
+    }
+
+    #[test]
+    fn test_write_within_block() {
+        let (_vfs, handle) = open_test_handle();
+        let data = b"hello world";
+        handle.write(0, data).unwrap();
+        let result = handle.read(0, data.len() as u32).unwrap();
+        assert_eq!(result.as_ref(), data);
+    }
+
+    #[test]
+    fn test_write_at_offset() {
+        let (_vfs, handle) = open_test_handle();
+        let data = b"offset write";
+        handle.write(16, data).unwrap();
+        let result = handle.read(16, data.len() as u32).unwrap();
+        assert_eq!(result.as_ref(), data);
+    }
+
+    #[test]
+    fn test_write_spanning_blocks() {
+        use crate::queries::block::BLOCK_SIZE;
+        let (_vfs, handle) = open_test_handle();
+
+        // Write 16 bytes starting 8 bytes before the end of block 0
+        let offset = BLOCK_SIZE - 8;
+        let data = [0xABu8; 16];
+        handle.write(offset, &data).unwrap();
+
+        let result = handle.read(offset, data.len() as u32).unwrap();
+        assert_eq!(result.as_ref(), &data);
     }
 }

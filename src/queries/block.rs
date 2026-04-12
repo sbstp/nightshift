@@ -79,6 +79,19 @@ pub fn create(
     Ok(written)
 }
 
+pub fn upsert(tx: &mut rusqlite::Transaction, ino: u64, bno: u64, data: &[u8], compression: Compression) -> Result<()> {
+    let mut block = Block::empty(ino, bno);
+    block.consume(data);
+    let mut scratch = Vec::new();
+    let cb = CompressedBlock::compress(&block, compression, &mut scratch);
+    let mut stmt = tx.prepare_cached(
+        "INSERT INTO block (ino, bno, data, compression) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(ino, bno) DO UPDATE SET data = excluded.data, compression = excluded.compression",
+    )?;
+    stmt.execute(params![ino, bno, cb.data, cb.compression as u8])?;
+    Ok(())
+}
+
 pub fn remove_blocks_from(tx: &mut rusqlite::Transaction, ino: u64, bno: u64) -> Result<()> {
     let mut stmt = tx.prepare_cached("DELETE FROM block WHERE ino = ? AND bno >= ?")?;
     stmt.execute(params![ino, bno])?;
@@ -207,6 +220,10 @@ impl Block {
         offset.into() / BLOCK_SIZE
     }
 
+    pub fn segments(offset: u64, len: usize) -> BlockSegments {
+        BlockSegments::new(offset, len)
+    }
+
     pub fn start_offset(&self) -> Absolute {
         (self.bno * BLOCK_SIZE).into()
     }
@@ -249,6 +266,52 @@ impl std::fmt::Debug for Block {
             .field("end_offset", &self.end_offset())
             .field("data.len()", &self.data.len())
             .finish()
+    }
+}
+
+pub struct BlockSegment {
+    /// Block number.
+    pub bno: u64,
+    /// Byte offset within the block.
+    pub rel_offset: usize,
+    /// Number of bytes to process in this block.
+    pub len: usize,
+    /// Byte offset within the caller's buffer.
+    pub data_offset: usize,
+}
+
+pub struct BlockSegments {
+    start_offset: u64,
+    cur_offset: u64,
+    end_offset: u64,
+}
+
+impl BlockSegments {
+    pub fn new(offset: u64, len: usize) -> Self {
+        Self {
+            start_offset: offset,
+            cur_offset: offset,
+            end_offset: offset + len as u64,
+        }
+    }
+}
+
+impl Iterator for BlockSegments {
+    type Item = BlockSegment;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cur_offset >= self.end_offset {
+            return None;
+        }
+        let bno = self.cur_offset / BLOCK_SIZE;
+        let block_start = bno * BLOCK_SIZE;
+        let rel_offset = (self.cur_offset - block_start) as usize;
+        let remaining_in_block = BLOCK_SIZE as usize - rel_offset;
+        let remaining_total = (self.end_offset - self.cur_offset) as usize;
+        let len = remaining_in_block.min(remaining_total);
+        let data_offset = (self.cur_offset - self.start_offset) as usize;
+        self.cur_offset += len as u64;
+        Some(BlockSegment { bno, rel_offset, len, data_offset })
     }
 }
 
