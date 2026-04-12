@@ -35,4 +35,4 @@ CREATE TABLE IF NOT EXISTS block (
 );
 
 CREATE INDEX IF NOT EXISTS block_bno_idx ON block (bno);
-CREATE INDEX IF NOT EXISTS block_ino_bno_idx ON block (ino, bno);
+CREATE UNIQUE INDEX IF NOT EXISTS block_ino_bno_idx ON block (ino, bno);

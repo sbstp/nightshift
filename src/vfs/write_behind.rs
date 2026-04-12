@@ -1,7 +1,12 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
-    sync::{mpsc, Arc},
+    sync::{
+        mpsc::{self, TryRecvError},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -69,50 +74,37 @@ struct WriteBehindHandle {
 
 fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx: mpsc::Receiver<Block>) {
     std::thread::spawn(move || loop {
-        todo!()
-    });
-}
+        let mut conn = pool.get().expect("should have connection");
+        let mut ops = Vec::new();
+        loop {
+            ops.clear();
 
-fn flush_batch(pool: &r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, batch: &[Block]) {
-    let mut conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("write-behind: failed to get db connection: {e}");
-            return;
+            match rx.try_recv() {
+                Ok(op) => ops.push(op),
+                Err(TryRecvError::Empty) => (),
+                Err(TryRecvError::Disconnected) => break,
+            }
+
+            let mut tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .expect("should start transaction");
+
+            for op in ops.drain(..) {
+                queries::block::upsert(&mut tx, op.ino.into(), op.bno.into(), &op.buf, Default::default())
+                    .expect("todo");
+            }
+            tx.commit().unwrap();
+
+            thread::sleep(Duration::from_millis(10));
         }
-    };
-    let mut tx = match conn.transaction() {
-        Ok(t) => t,
-        Err(e) => {
-            log::error!("write-behind: failed to start transaction: {e}");
-            return;
-        }
-    };
-    for block in batch {
-        if let Err(e) = queries::block::upsert(
-            &mut tx,
-            block.ino.into(),
-            block.bno.into(),
-            &block.buf,
-            Default::default(),
-        ) {
-            log::error!(
-                "write-behind: upsert failed for ino={} bno={}: {e}",
-                block.ino.0,
-                block.bno.0
-            );
-        }
-    }
-    if let Err(e) = tx.commit() {
-        log::error!("write-behind: commit failed: {e}");
-    }
+    });
 }
 
 impl WriteBehind {
     #[cfg(test)]
     pub fn new_for_test() -> anyhow::Result<Self> {
         let manager = r2d2_sqlite::SqliteConnectionManager::memory();
-        let pool = r2d2::Pool::builder().max_size(1).build(manager)?;
+        let pool = r2d2::Pool::builder().build(manager)?;
 
         {
             let mut conn = pool.get()?;
@@ -261,7 +253,6 @@ impl VfsHandle for WriteBehindHandle {
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
         for seg in BaseBlock::segments(offset, data.len()) {
-            // RMW: load existing block from cache/DB, or start with empty bytes
             let existing_buf = match self.core.load_block(self.ino, seg.bno.into()) {
                 Ok(b) => b.buf,
                 Err(crate::errors::Error::NotFound) => Bytes::new(),
@@ -295,6 +286,78 @@ impl VfsHandle for WriteBehindHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a shared in-memory SQLite pool. All connections to the same `db_name`
+    /// share state, so the write thread and the test query can both see the same rows.
+    fn shared_memory_pool(db_name: &str, max_size: u32) -> r2d2::Pool<r2d2_sqlite::SqliteConnectionManager> {
+        let uri = format!("file:{db_name}?mode=memory&cache=shared");
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(uri).with_flags(flags);
+        r2d2::Pool::builder().max_size(max_size).build(manager).unwrap()
+    }
+
+    #[test]
+    fn test_spawn_write_thread_persists_block() {
+        // Two connections: one held by the write thread, one for the verification query.
+        let pool = shared_memory_pool("test_spawn_write_thread_persists_block", 2);
+
+        {
+            let mut conn = pool.get().unwrap();
+            crate::database::migrate_database(&mut conn).unwrap();
+        }
+
+        // Create an inode so the FK constraint on the block table is satisfied.
+        let ino: u64 = {
+            let mut conn = pool.get().unwrap();
+            let mut tx = conn.transaction().unwrap();
+            let mut attr = fuser::FileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: std::time::UNIX_EPOCH,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                crtime: std::time::UNIX_EPOCH,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            };
+            queries::inode::create(&mut tx, &mut attr).unwrap();
+            tx.commit().unwrap();
+            attr.ino
+        };
+
+        let (write_tx, write_rx) = mpsc::channel::<Block>();
+        spawn_write_thread(pool.clone(), write_rx);
+
+        let data = Bytes::from_static(b"hello write thread");
+        write_tx
+            .send(Block {
+                ino: ino.into(),
+                bno: 0u64.into(),
+                buf: data.clone(),
+            })
+            .unwrap();
+
+        // Signal that no more blocks are coming. The write thread will receive
+        // TryRecvError::Disconnected on its next iteration.
+        drop(write_tx);
+
+        // The inner loop sleeps 10ms per iteration; 100ms gives it ample time.
+        thread::sleep(Duration::from_millis(100));
+
+        let mut conn = pool.get().unwrap();
+        let mut db_tx = conn.transaction().unwrap();
+        let block = queries::block::get_block(&mut db_tx, ino, 0).unwrap();
+        assert_eq!(&block.data[..data.len()], data.as_ref());
+    }
 
     impl WriteBehind {
         #[cfg(test)]

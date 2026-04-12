@@ -79,6 +79,7 @@ pub fn create(
     Ok(written)
 }
 
+// TODO bad
 pub fn upsert(tx: &mut rusqlite::Transaction, ino: u64, bno: u64, data: &[u8], compression: Compression) -> Result<()> {
     let mut block = Block::empty(ino, bno);
     block.consume(data);
@@ -311,7 +312,12 @@ impl Iterator for BlockSegments {
         let len = remaining_in_block.min(remaining_total);
         let data_offset = (self.cur_offset - self.start_offset) as usize;
         self.cur_offset += len as u64;
-        Some(BlockSegment { bno, rel_offset, len, data_offset })
+        Some(BlockSegment {
+            bno,
+            rel_offset,
+            len,
+            data_offset,
+        })
     }
 }
 
