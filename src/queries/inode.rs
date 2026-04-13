@@ -62,6 +62,37 @@ pub fn create(tx: &mut rusqlite::Transaction, attr: &mut fuser::FileAttr) -> Res
     Ok(())
 }
 
+pub fn create_with_ino(tx: &mut rusqlite::Transaction, attr: &fuser::FileAttr) -> Result<()> {
+    let atime = TimeSpec::from(attr.atime);
+    let mtime = TimeSpec::from(attr.mtime);
+    let ctime = TimeSpec::from(attr.ctime);
+    let crtime = TimeSpec::from(attr.crtime);
+
+    let mut stmt = tx.prepare_cached(include_str!("sql/create_inode_with_ino.sql"))?;
+    stmt.insert(params![
+        attr.ino,
+        attr.size,
+        attr.blocks,
+        atime.secs,
+        atime.nanos,
+        mtime.secs,
+        mtime.nanos,
+        ctime.secs,
+        ctime.nanos,
+        crtime.secs,
+        crtime.nanos,
+        FileType::export(attr.kind),
+        attr.perm,
+        attr.nlink,
+        attr.uid,
+        attr.gid,
+        attr.rdev,
+        attr.blksize,
+        attr.flags,
+    ])?;
+    Ok(())
+}
+
 pub fn set_attr(
     tx: &mut rusqlite::Transaction,
     ino: u64,

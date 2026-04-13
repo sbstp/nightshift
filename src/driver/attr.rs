@@ -72,6 +72,11 @@ impl FileAttrBuilder {
         self
     }
 
+    pub fn with_ino(mut self, ino: u64) -> FileAttrBuilder {
+        self.attr.ino = ino;
+        self
+    }
+
     pub fn with_rdev(mut self, rdev: u32) -> FileAttrBuilder {
         self.attr.rdev = rdev;
         self

@@ -37,6 +37,9 @@ pub trait Vfs: Clone + Send + Sync {
     fn lookup_name(&self, parent: Ino, name: &OsStr) -> Result<FileAttr, Self::Error>;
     fn lookup_ino(&self, ino: Ino) -> Result<FileAttr, Self::Error>;
 
+    fn mknod(&self, parent: Ino, name: &OsStr, mode: u32, umask: u32, rdev: u32, uid: u32, gid: u32) -> Result<FileAttr, Self::Error>;
+    fn mkdir(&self, parent: Ino, name: &OsStr, mode: u32, umask: u32, uid: u32, gid: u32) -> Result<FileAttr, Self::Error>;
+
     fn open(&self, ino: Ino, flags: OpenFlags) -> Result<Self::Handle, Self::Error>;
     fn close(&self, fno: Fno) -> Result<(), Self::Error>;
     fn handle(&self, fno: Fno) -> Option<Self::Handle>;

@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
-mod attr;
+pub mod attr;
 mod flags;
 mod handle;
 mod request_info;
