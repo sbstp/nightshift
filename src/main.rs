@@ -12,6 +12,7 @@ mod vfs;
 
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -29,6 +30,7 @@ use scopeguard::defer;
 
 use crate::database::DatabaseOps;
 use crate::driver::FuseDriver;
+use crate::vfs::sync_vfs::SyncVfs;
 use simple_logger::SimpleLogger;
 
 #[derive(Parser, Debug)]
@@ -130,7 +132,9 @@ fn main() -> anyhow::Result<()> {
             key_group,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db, compression.unwrap_or_default(), &mount_path)?;
+            let md = fs::metadata(&mount_path).context("read mount path metadata")?;
+            let vfs = SyncVfs::new(db, compression.unwrap_or_default());
+            let driver = FuseDriver::new(vfs, md.uid(), md.gid());
 
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
@@ -154,7 +158,9 @@ fn main() -> anyhow::Result<()> {
             args,
         } => {
             let db = DatabaseOps::open(&database_path, key_group.read_key()?).context("open db")?;
-            let driver = FuseDriver::new(db, compression.unwrap_or_default(), &mount_path)?;
+            let md = fs::metadata(&mount_path).context("read mount path metadata")?;
+            let vfs = SyncVfs::new(db, compression.unwrap_or_default());
+            let driver = FuseDriver::new(vfs, md.uid(), md.gid());
             let mount = fuser::spawn_mount2(driver, &mount_path, &[]).context("unable to create mount")?;
             defer! {
                 // Umount & cleanup
