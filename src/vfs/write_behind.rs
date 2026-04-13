@@ -16,7 +16,12 @@ use slab::Slab;
 use zstd::zstd_safe::WriteBuf;
 
 use crate::queries::block::Block as BaseBlock;
-use crate::{driver::{attr::FileAttrBuilder, OpenFlags}, queries, types::FileType, vfs::Bno};
+use crate::{
+    driver::{attr::FileAttrBuilder, OpenFlags},
+    queries,
+    types::FileType,
+    vfs::Bno,
+};
 
 use super::{Fno, Ino, Vfs, VfsHandle};
 
@@ -88,10 +93,12 @@ fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx
         loop {
             ops.clear();
 
-            match rx.try_recv() {
-                Ok(op) => ops.push(op),
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => break,
+            for _ in 0..256 {
+                match rx.try_recv() {
+                    Ok(op) => ops.push(op),
+                    Err(TryRecvError::Empty) => (),
+                    Err(TryRecvError::Disconnected) => break,
+                }
             }
 
             if !ops.is_empty() {
@@ -102,8 +109,14 @@ fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx
                 for op in ops.drain(..) {
                     match op {
                         WriteOp::Block(block) => {
-                            queries::block::upsert(&mut tx, block.ino.into(), block.bno.into(), &block.buf, Default::default())
-                                .expect("todo");
+                            queries::block::upsert(
+                                &mut tx,
+                                block.ino.into(),
+                                block.bno.into(),
+                                &block.buf,
+                                Default::default(),
+                            )
+                            .expect("todo");
                         }
                         WriteOp::CreateEntry { attr, parent, name } => {
                             queries::inode::create_with_ino(&mut tx, &attr).expect("todo");
@@ -132,11 +145,7 @@ impl WriteBehind {
 
         let next_ino = {
             let conn = pool.get()?;
-            let max_ino: u64 = conn.query_row(
-                "SELECT COALESCE(MAX(ino), 0) FROM inode",
-                [],
-                |row| row.get(0),
-            )?;
+            let max_ino: u64 = conn.query_row("SELECT COALESCE(MAX(ino), 0) FROM inode", [], |row| row.get(0))?;
             AtomicU64::new(max_ino + 1)
         };
 
@@ -548,7 +557,15 @@ mod tests {
         let parent = vfs.insert_test_dir();
 
         let attr = vfs
-            .mknod(parent, OsStr::new("hello.txt"), libc::S_IFREG | 0o644, 0o022, 0, 1000, 1000)
+            .mknod(
+                parent,
+                OsStr::new("hello.txt"),
+                libc::S_IFREG | 0o644,
+                0o022,
+                0,
+                1000,
+                1000,
+            )
             .unwrap();
 
         assert_eq!(attr.kind, fuser::FileType::RegularFile);
@@ -585,9 +602,7 @@ mod tests {
         let vfs = WriteBehind::new_for_test().unwrap();
         let parent = vfs.insert_test_dir();
 
-        let attr = vfs
-            .mkdir(parent, OsStr::new("subdir"), 0o755, 0o022, 500, 500)
-            .unwrap();
+        let attr = vfs.mkdir(parent, OsStr::new("subdir"), 0o755, 0o022, 500, 500).unwrap();
 
         assert_eq!(attr.kind, fuser::FileType::Directory);
         assert_eq!(attr.uid, 500);
