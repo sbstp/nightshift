@@ -56,35 +56,38 @@ pub trait Vfs: Clone + Send + Sync {
         bkuptime: Option<TimeSpec>,
         flags: Option<u32>,
     ) -> Result<FileAttr, Self::Error> {
-        let _ = (ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime, flags);
+        let _ = (
+            ino, mode, uid, gid, size, atime, mtime, ctime, fh, crtime, chgtime, bkuptime, flags,
+        );
         unimplemented!()
     }
 
-    fn mknod(&self, parent: Ino, name: &OsStr, mode: u32, umask: u32, rdev: u32, uid: u32, gid: u32) -> Result<FileAttr, Self::Error>;
-    fn mkdir(&self, parent: Ino, name: &OsStr, mode: u32, umask: u32, uid: u32, gid: u32) -> Result<FileAttr, Self::Error>;
+    fn mknod(
+        &self,
+        parent: Ino,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, Self::Error>;
+    fn link(&self, ino: Ino, newparent: Ino, newname: &OsStr) -> Result<FileAttr, Self::Error>;
+    fn unlink(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error>;
+    fn rename(&self, parent: Ino, name: &OsStr, newparent: Ino, newname: &OsStr, flags: u32)
+        -> Result<(), Self::Error>;
 
-    fn link(&self, ino: Ino, newparent: Ino, newname: &OsStr) -> Result<FileAttr, Self::Error> {
-        let _ = (ino, newparent, newname);
-        unimplemented!()
-    }
-
-    fn unlink(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error> {
-        let _ = (parent, name);
-        unimplemented!()
-    }
-
-    fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error> {
-        let _ = (parent, name);
-        unimplemented!()
-    }
-
+    fn mkdir(
+        &self,
+        parent: Ino,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, Self::Error>;
+    fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error>;
     fn readdir(&self, ino: Ino, offset: i64, f: &mut dyn FnMut(ListDirEntry) -> bool) -> Result<(), Self::Error> {
-        let _ = (ino, offset, f);
-        unimplemented!()
-    }
-
-    fn rename(&self, parent: Ino, name: &OsStr, newparent: Ino, newname: &OsStr, flags: u32) -> Result<(), Self::Error> {
-        let _ = (parent, name, newparent, newname, flags);
         unimplemented!()
     }
 

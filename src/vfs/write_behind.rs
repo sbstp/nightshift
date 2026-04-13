@@ -60,6 +60,27 @@ enum WriteOp {
         parent: u64,
         name: OsString,
     },
+    CreateLink {
+        ino: u64,
+        parent: u64,
+        name: OsString,
+        new_nlink: u32,
+    },
+    UnlinkEntry {
+        ino: u64,
+        parent: u64,
+        name: OsString,
+        new_nlink: u32,
+    },
+    RemoveInode {
+        ino: u64,
+    },
+    Rename {
+        parent: u64,
+        name: OsString,
+        new_parent: u64,
+        new_name: OsString,
+    },
 }
 
 struct WriteBehindCore {
@@ -87,7 +108,7 @@ struct WriteBehindHandle {
 }
 
 fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx: mpsc::Receiver<WriteOp>) {
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
         let mut conn = pool.get().expect("should have connection");
         let mut ops = Vec::new();
         loop {
@@ -121,6 +142,20 @@ fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx
                         WriteOp::CreateEntry { attr, parent, name } => {
                             queries::inode::create_with_ino(&mut tx, &attr).expect("todo");
                             queries::dir_entry::create(&mut tx, parent, &name, attr.ino).expect("todo");
+                        }
+                        WriteOp::CreateLink { ino, parent, name, new_nlink } => {
+                            queries::dir_entry::create(&mut tx, parent, &name, ino).expect("todo");
+                            queries::inode::set_attr(&mut tx, ino, "nlink", new_nlink).expect("todo");
+                        }
+                        WriteOp::UnlinkEntry { ino, parent, name, new_nlink } => {
+                            queries::dir_entry::remove(&mut tx, parent, &name).expect("todo");
+                            queries::inode::set_attr(&mut tx, ino, "nlink", new_nlink).expect("todo");
+                        }
+                        WriteOp::RemoveInode { ino } => {
+                            queries::inode::remove(&mut tx, ino).expect("todo");
+                        }
+                        WriteOp::Rename { parent, name, new_parent, new_name } => {
+                            queries::dir_entry::rename(&mut tx, parent, &name, new_parent, &new_name).expect("todo");
                         }
                     }
                 }
@@ -223,7 +258,19 @@ impl Vfs for WriteBehind {
     type Error = crate::errors::Error;
 
     fn ensure_root(&self) -> Result<(), Self::Error> {
-        todo!()
+        match self.core.load_ino(1u64.into()) {
+            Ok(_) => return Ok(()),
+            Err(crate::errors::Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let attr = FileAttrBuilder::new_directory().with_ino(1).build();
+        let mut conn = self.core.pool.get()?;
+        let mut tx = conn.transaction()?;
+        queries::inode::create_with_ino(&mut tx, &attr)?;
+        tx.commit()?;
+        self.core.nodes.insert(1u64.into(), attr);
+        self.core.next_ino.fetch_max(2, Ordering::Relaxed);
+        Ok(())
     }
 
     fn lookup_name(&self, parent: super::Ino, name: &OsStr) -> Result<fuser::FileAttr, Self::Error> {
@@ -291,6 +338,68 @@ impl Vfs for WriteBehind {
             name: name.to_os_string(),
         });
         Ok(attr)
+    }
+
+    fn link(&self, ino: Ino, newparent: Ino, newname: &OsStr) -> Result<FileAttr, Self::Error> {
+        let mut attr = self.core.load_ino(ino)?;
+        attr.nlink += 1;
+        self.core.nodes.insert(ino, attr);
+        self.core.entries.insert(newname.to_os_string(), ino);
+        let _ = self.core.write_tx.send(WriteOp::CreateLink {
+            ino: ino.into(),
+            parent: newparent.into(),
+            name: newname.to_os_string(),
+            new_nlink: attr.nlink,
+        });
+        Ok(attr)
+    }
+
+    fn unlink(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error> {
+        let ino = self.core.load_entry(parent, name)?;
+        let mut attr = self.core.load_ino(ino)?;
+        attr.nlink -= 1;
+        self.core.entries.remove(&name.to_os_string());
+        if attr.nlink > 0 {
+            self.core.nodes.insert(ino, attr);
+            let _ = self.core.write_tx.send(WriteOp::UnlinkEntry {
+                ino: ino.into(),
+                parent: parent.into(),
+                name: name.to_os_string(),
+                new_nlink: attr.nlink,
+            });
+        } else {
+            self.core.nodes.remove(&ino);
+            let _ = self.core.write_tx.send(WriteOp::RemoveInode { ino: ino.into() });
+        }
+        Ok(())
+    }
+
+    fn rename(&self, parent: Ino, name: &OsStr, newparent: Ino, newname: &OsStr, _flags: u32) -> Result<(), Self::Error> {
+        let ino = self.core.load_entry(parent, name)?;
+        self.core.entries.remove(&name.to_os_string());
+        self.core.entries.insert(newname.to_os_string(), ino);
+        let _ = self.core.write_tx.send(WriteOp::Rename {
+            parent: parent.into(),
+            name: name.to_os_string(),
+            new_parent: newparent.into(),
+            new_name: newname.to_os_string(),
+        });
+        Ok(())
+    }
+
+    fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error> {
+        let ino = self.core.load_entry(parent, name)?;
+        let mut conn = self.core.pool.get()?;
+        let mut tx = conn.transaction()?;
+        let empty = queries::dir_entry::is_dir_empty(&mut tx, ino.into())?;
+        drop(tx);
+        if !empty {
+            return Err(crate::errors::Error::NotEmpty);
+        }
+        self.core.entries.remove(&name.to_os_string());
+        self.core.nodes.remove(&ino);
+        let _ = self.core.write_tx.send(WriteOp::RemoveInode { ino: ino.into() });
+        Ok(())
     }
 
     fn open(&self, ino: super::Ino, flags: OpenFlags) -> Result<Self::Handle, Self::Error> {
