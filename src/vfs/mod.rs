@@ -87,9 +87,7 @@ pub trait Vfs: Clone + Send + Sync {
         gid: u32,
     ) -> Result<FileAttr, Self::Error>;
     fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error>;
-    fn readdir(&self, ino: Ino, offset: i64, f: &mut dyn FnMut(ListDirEntry) -> bool) -> Result<(), Self::Error> {
-        unimplemented!()
-    }
+    fn readdir(&self, ino: Ino, offset: i64, f: &mut dyn FnMut(ListDirEntry) -> bool) -> Result<(), Self::Error>;
 
     fn open(&self, ino: Ino, flags: OpenFlags) -> Result<Self::Handle, Self::Error>;
     fn close(&self, fno: Fno) -> Result<(), Self::Error>;

@@ -23,6 +23,7 @@ use crate::{
     vfs::Bno,
 };
 
+use crate::queries::dir_entry::ListDirEntry;
 use super::{Fno, Ino, Vfs, VfsHandle};
 
 #[derive(Clone)]
@@ -50,6 +51,28 @@ impl From<queries::block::Block> for Block {
             bno: value.bno.into(),
             buf: value.data.freeze(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct CachedDirEntry {
+    ino: Ino,
+    name: OsString,
+    kind: fuser::FileType,
+}
+
+#[derive(Debug)]
+struct DirContents {
+    entries: Vec<CachedDirEntry>,
+}
+
+impl DirContents {
+    fn push_new(&mut self, ino: Ino, name: OsString, kind: fuser::FileType) {
+        self.entries.push(CachedDirEntry { ino, name, kind });
+    }
+
+    fn remove_by_name(&mut self, name: &OsStr) {
+        self.entries.retain(|e| e.name.as_os_str() != name);
     }
 }
 
@@ -89,6 +112,7 @@ struct WriteBehindCore {
     nodes: Cache<Ino, FileAttr>,
     entries: Cache<OsString, Ino>,
     blocks: Cache<(Ino, Bno), Block>,
+    dirs: Cache<Ino, Arc<parking_lot::RwLock<DirContents>>>,
     handles: parking_lot::RwLock<Slab<WriteBehindHandle>>,
     write_tx: mpsc::Sender<WriteOp>,
     next_ino: AtomicU64,
@@ -143,18 +167,33 @@ fn spawn_write_thread(pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>, rx
                             queries::inode::create_with_ino(&mut tx, &attr).expect("todo");
                             queries::dir_entry::create(&mut tx, parent, &name, attr.ino).expect("todo");
                         }
-                        WriteOp::CreateLink { ino, parent, name, new_nlink } => {
+                        WriteOp::CreateLink {
+                            ino,
+                            parent,
+                            name,
+                            new_nlink,
+                        } => {
                             queries::dir_entry::create(&mut tx, parent, &name, ino).expect("todo");
                             queries::inode::set_attr(&mut tx, ino, "nlink", new_nlink).expect("todo");
                         }
-                        WriteOp::UnlinkEntry { ino, parent, name, new_nlink } => {
+                        WriteOp::UnlinkEntry {
+                            ino,
+                            parent,
+                            name,
+                            new_nlink,
+                        } => {
                             queries::dir_entry::remove(&mut tx, parent, &name).expect("todo");
                             queries::inode::set_attr(&mut tx, ino, "nlink", new_nlink).expect("todo");
                         }
                         WriteOp::RemoveInode { ino } => {
                             queries::inode::remove(&mut tx, ino).expect("todo");
                         }
-                        WriteOp::Rename { parent, name, new_parent, new_name } => {
+                        WriteOp::Rename {
+                            parent,
+                            name,
+                            new_parent,
+                            new_name,
+                        } => {
                             queries::dir_entry::rename(&mut tx, parent, &name, new_parent, &new_name).expect("todo");
                         }
                     }
@@ -193,6 +232,7 @@ impl WriteBehind {
                 nodes: Cache::new(128),
                 entries: Cache::new(128),
                 blocks: Cache::new(256),
+                dirs: Cache::new(64),
                 handles: parking_lot::RwLock::new(Slab::new()),
                 write_tx,
                 next_ino,
@@ -232,6 +272,31 @@ impl WriteBehindCore {
             _ => unreachable!(),
         };
         Ok(attr)
+    }
+
+    fn load_dir(&self, ino: Ino) -> Result<Arc<parking_lot::RwLock<DirContents>>, crate::errors::Error> {
+        let result = self.dirs.entry(&ino, None, |_, v| EntryAction::Retain(v.clone()));
+        let arc = match result {
+            EntryResult::Vacant(placeholder) => {
+                let mut conn = self.pool.get()?;
+                let mut tx = conn.transaction()?;
+                let mut entries = Vec::new();
+                queries::dir_entry::list_dir(&mut tx, ino.into(), 0, |entry| {
+                    entries.push(CachedDirEntry {
+                        ino: entry.ino.into(),
+                        name: entry.name.to_os_string(),
+                        kind: entry.kind,
+                    });
+                    true
+                })?;
+                let arc = Arc::new(parking_lot::RwLock::new(DirContents { entries }));
+                placeholder.insert(arc.clone()).expect("no insert failure");
+                arc
+            }
+            EntryResult::Retained(arc) => arc,
+            _ => unreachable!(),
+        };
+        Ok(arc)
     }
 
     fn load_block(&self, ino: Ino, bno: Bno) -> Result<Block, crate::errors::Error> {
@@ -305,6 +370,7 @@ impl Vfs for WriteBehind {
 
         self.core.nodes.insert(attr.ino.into(), attr);
         self.core.entries.insert(name.to_os_string(), attr.ino.into());
+        self.core.load_dir(parent)?.write().push_new(attr.ino.into(), name.to_os_string(), attr.kind);
         let _ = self.core.write_tx.send(WriteOp::CreateEntry {
             attr,
             parent: parent.into(),
@@ -332,6 +398,7 @@ impl Vfs for WriteBehind {
 
         self.core.nodes.insert(attr.ino.into(), attr);
         self.core.entries.insert(name.to_os_string(), attr.ino.into());
+        self.core.load_dir(parent)?.write().push_new(attr.ino.into(), name.to_os_string(), attr.kind);
         let _ = self.core.write_tx.send(WriteOp::CreateEntry {
             attr,
             parent: parent.into(),
@@ -345,6 +412,7 @@ impl Vfs for WriteBehind {
         attr.nlink += 1;
         self.core.nodes.insert(ino, attr);
         self.core.entries.insert(newname.to_os_string(), ino);
+        self.core.load_dir(newparent)?.write().push_new(ino, newname.to_os_string(), attr.kind);
         let _ = self.core.write_tx.send(WriteOp::CreateLink {
             ino: ino.into(),
             parent: newparent.into(),
@@ -358,7 +426,8 @@ impl Vfs for WriteBehind {
         let ino = self.core.load_entry(parent, name)?;
         let mut attr = self.core.load_ino(ino)?;
         attr.nlink -= 1;
-        self.core.entries.remove(&name.to_os_string());
+        self.core.entries.remove(name);
+        self.core.load_dir(parent)?.write().remove_by_name(name);
         if attr.nlink > 0 {
             self.core.nodes.insert(ino, attr);
             let _ = self.core.write_tx.send(WriteOp::UnlinkEntry {
@@ -374,31 +443,57 @@ impl Vfs for WriteBehind {
         Ok(())
     }
 
-    fn rename(&self, parent: Ino, name: &OsStr, newparent: Ino, newname: &OsStr, _flags: u32) -> Result<(), Self::Error> {
+    fn rename(
+        &self,
+        parent: Ino,
+        name: &OsStr,
+        new_parent: Ino,
+        new_name: &OsStr,
+        _flags: u32,
+    ) -> Result<(), Self::Error> {
         let ino = self.core.load_entry(parent, name)?;
-        self.core.entries.remove(&name.to_os_string());
-        self.core.entries.insert(newname.to_os_string(), ino);
+        let moved_attr = self.core.load_ino(ino)?;
+        self.core.entries.remove(name);
+        self.core.entries.insert(new_name.to_os_string(), ino);
+        self.core.load_dir(parent)?.write().remove_by_name(name);
+        self.core.load_dir(new_parent)?.write().push_new(ino, new_name.to_os_string(), moved_attr.kind);
         let _ = self.core.write_tx.send(WriteOp::Rename {
             parent: parent.into(),
             name: name.to_os_string(),
-            new_parent: newparent.into(),
-            new_name: newname.to_os_string(),
+            new_parent: new_parent.into(),
+            new_name: new_name.to_os_string(),
         });
         Ok(())
     }
 
     fn rmdir(&self, parent: Ino, name: &OsStr) -> Result<(), Self::Error> {
         let ino = self.core.load_entry(parent, name)?;
-        let mut conn = self.core.pool.get()?;
-        let mut tx = conn.transaction()?;
-        let empty = queries::dir_entry::is_dir_empty(&mut tx, ino.into())?;
-        drop(tx);
-        if !empty {
+        let dir = self.core.load_dir(ino)?;
+        if !dir.read().entries.is_empty() {
             return Err(crate::errors::Error::NotEmpty);
         }
         self.core.entries.remove(&name.to_os_string());
         self.core.nodes.remove(&ino);
+        self.core.dirs.remove(&ino);
+        self.core.load_dir(parent)?.write().remove_by_name(name);
         let _ = self.core.write_tx.send(WriteOp::RemoveInode { ino: ino.into() });
+        Ok(())
+    }
+
+    fn readdir(&self, ino: Ino, offset: i64, f: &mut dyn FnMut(ListDirEntry) -> bool) -> Result<(), Self::Error> {
+        let arc = self.core.load_dir(ino)?;
+        let guard = arc.read();
+        for (idx, entry) in guard.entries.iter().enumerate().skip(offset as usize) {
+            let list_entry = ListDirEntry {
+                offset: (idx + 1) as i64,
+                ino: entry.ino.into(),
+                name: entry.name.as_os_str(),
+                kind: entry.kind,
+            };
+            if !f(list_entry) {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -734,5 +829,225 @@ mod tests {
             .unwrap();
 
         assert_ne!(dir_attr.ino, file_attr.ino);
+    }
+
+    fn collect_readdir(vfs: &WriteBehind, ino: Ino, offset: i64) -> Vec<(OsString, u64)> {
+        let mut result = Vec::new();
+        vfs.readdir(ino, offset, &mut |entry| {
+            result.push((entry.name.to_os_string(), entry.ino));
+            true
+        })
+        .unwrap();
+        result
+    }
+
+    #[test]
+    fn test_readdir_empty_dir() {
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let dir = vfs.insert_test_dir();
+        let entries = collect_readdir(&vfs, dir, 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_readdir_after_mknod() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let parent = vfs.insert_test_dir();
+        let attr = vfs
+            .mknod(parent, OsStr::new("foo.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .unwrap();
+
+        let entries = collect_readdir(&vfs, parent, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OsString::from("foo.txt"));
+        assert_eq!(entries[0].1, attr.ino);
+    }
+
+    #[test]
+    fn test_readdir_after_mkdir() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let parent = vfs.insert_test_dir();
+        let attr = vfs.mkdir(parent, OsStr::new("subdir"), 0o755, 0, 0, 0).unwrap();
+
+        let mut kinds = Vec::new();
+        vfs.readdir(parent, 0, &mut |entry| {
+            kinds.push(entry.kind);
+            true
+        })
+        .unwrap();
+        assert_eq!(kinds, vec![fuser::FileType::Directory]);
+
+        let entries = collect_readdir(&vfs, parent, 0);
+        assert_eq!(entries[0].1, attr.ino);
+    }
+
+    #[test]
+    fn test_readdir_with_offset() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let parent = vfs.insert_test_dir();
+        vfs.mknod(parent, OsStr::new("a.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0).unwrap();
+        let b_attr = vfs
+            .mknod(parent, OsStr::new("b.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .unwrap();
+
+        // First call returns both; capture the offset after the first entry.
+        let mut first_offset = 0i64;
+        vfs.readdir(parent, 0, &mut |entry| {
+            first_offset = entry.offset;
+            false // stop after first
+        })
+        .unwrap();
+
+        // Resume from that offset — should yield only b.txt.
+        let resumed = collect_readdir(&vfs, parent, first_offset);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].0, OsString::from("b.txt"));
+        assert_eq!(resumed[0].1, b_attr.ino);
+    }
+
+    #[test]
+    fn test_readdir_after_unlink() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let parent = vfs.insert_test_dir();
+        vfs.mknod(parent, OsStr::new("gone.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0).unwrap();
+
+        // Warm the cache.
+        assert_eq!(collect_readdir(&vfs, parent, 0).len(), 1);
+
+        vfs.unlink(parent, OsStr::new("gone.txt")).unwrap();
+        assert!(collect_readdir(&vfs, parent, 0).is_empty());
+    }
+
+    #[test]
+    fn test_readdir_after_rename() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let src_dir = vfs.insert_test_dir();
+        let dst_dir = vfs.insert_test_dir();
+        let attr = vfs
+            .mknod(src_dir, OsStr::new("orig.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .unwrap();
+
+        // Warm both dir caches.
+        assert_eq!(collect_readdir(&vfs, src_dir, 0).len(), 1);
+        assert_eq!(collect_readdir(&vfs, dst_dir, 0).len(), 0);
+
+        vfs.rename(src_dir, OsStr::new("orig.txt"), dst_dir, OsStr::new("moved.txt"), 0)
+            .unwrap();
+
+        assert!(collect_readdir(&vfs, src_dir, 0).is_empty());
+        let dst_entries = collect_readdir(&vfs, dst_dir, 0);
+        assert_eq!(dst_entries.len(), 1);
+        assert_eq!(dst_entries[0].0, OsString::from("moved.txt"));
+        assert_eq!(dst_entries[0].1, attr.ino);
+    }
+
+    #[test]
+    fn test_readdir_after_link() {
+        use std::ffi::OsStr;
+        let vfs = WriteBehind::new_for_test().unwrap();
+        let src_dir = vfs.insert_test_dir();
+        let dst_dir = vfs.insert_test_dir();
+        let attr = vfs
+            .mknod(src_dir, OsStr::new("file.txt"), libc::S_IFREG | 0o644, 0, 0, 0, 0)
+            .unwrap();
+
+        // Warm dst cache.
+        assert_eq!(collect_readdir(&vfs, dst_dir, 0).len(), 0);
+
+        vfs.link(attr.ino.into(), dst_dir, OsStr::new("link.txt")).unwrap();
+
+        let dst_entries = collect_readdir(&vfs, dst_dir, 0);
+        assert_eq!(dst_entries.len(), 1);
+        assert_eq!(dst_entries[0].0, OsString::from("link.txt"));
+        assert_eq!(dst_entries[0].1, attr.ino);
+    }
+
+    #[test]
+    fn test_readdir_db_fallback() {
+        use std::ffi::OsStr;
+        // Insert entries directly into the DB (simulating post-flush state) and
+        // verify that a cold readdir loads them correctly.
+        let pool = shared_memory_pool("test_readdir_db_fallback", 2);
+        {
+            let mut conn = pool.get().unwrap();
+            crate::database::migrate_database(&mut conn).unwrap();
+        }
+
+        // Create parent dir and a child file via raw SQL.
+        let (parent_ino, child_ino) = {
+            let mut conn = pool.get().unwrap();
+            let mut tx = conn.transaction().unwrap();
+            let mut dir_attr = fuser::FileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: std::time::UNIX_EPOCH,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                crtime: std::time::UNIX_EPOCH,
+                kind: fuser::FileType::Directory,
+                perm: 0o755,
+                nlink: 2,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            };
+            queries::inode::create(&mut tx, &mut dir_attr).unwrap();
+            let mut file_attr = fuser::FileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: std::time::UNIX_EPOCH,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+                crtime: std::time::UNIX_EPOCH,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            };
+            queries::inode::create(&mut tx, &mut file_attr).unwrap();
+            queries::dir_entry::create(&mut tx, dir_attr.ino, OsStr::new("from_db.txt"), file_attr.ino).unwrap();
+            tx.commit().unwrap();
+            (dir_attr.ino, file_attr.ino)
+        };
+
+        let (write_tx, write_rx) = mpsc::channel::<WriteOp>();
+        spawn_write_thread(pool.clone(), write_rx);
+        let next_ino = {
+            let conn = pool.get().unwrap();
+            let max_ino: u64 = conn
+                .query_row("SELECT COALESCE(MAX(ino), 0) FROM inode", [], |row| row.get(0))
+                .unwrap();
+            AtomicU64::new(max_ino + 1)
+        };
+        let vfs = WriteBehind {
+            core: Arc::new(WriteBehindCore {
+                pool,
+                nodes: Cache::new(128),
+                entries: Cache::new(128),
+                blocks: Cache::new(256),
+                dirs: Cache::new(64),
+                handles: parking_lot::RwLock::new(Slab::new()),
+                write_tx,
+                next_ino,
+            }),
+        };
+
+        let entries = collect_readdir(&vfs, parent_ino.into(), 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, OsString::from("from_db.txt"));
+        assert_eq!(entries[0].1, child_ino);
     }
 }
